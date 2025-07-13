@@ -1,0 +1,394 @@
+# BlockDB Cursor AI Development Rules
+
+This file contains AI development guidelines for maintaining BlockDB, a distributed append-only database with blockchain verification.
+
+## Project Context
+
+BlockDB is a high-performance, distributed database built entirely by Claude AI with these core principles:
+- Append-only architecture (no updates/deletes)
+- LSM-tree storage with blockchain verification
+- Raft consensus for distributed coordination
+- ACID transactions with deadlock detection
+- Written in Rust for memory safety and performance
+
+## Development Guidelines
+
+### 1. Core Architecture Principles
+
+**ALWAYS MAINTAIN:**
+- Append-only data model - never allow updates or deletes
+- Cryptographic integrity through blockchain verification
+- Raft consensus for all distributed state changes
+- ACID transaction compliance
+- Memory safety through Rust patterns
+
+**NEVER BREAK:**
+- Immutability guarantees
+- Consensus safety properties
+- Transaction isolation levels
+- Existing API contracts
+
+### 2. Code Organization Rules
+
+**File Structure:**
+- Keep storage logic in `src/storage/`
+- Consensus implementation in `src/consensus/`
+- Transaction management in `src/transaction/`
+- API interfaces in `src/api/`
+- Binary targets in `src/bin/`
+
+**Module Patterns:**
+- Each module has clear public interface in `mod.rs`
+- Private implementation details in separate files
+- Consistent error handling with `BlockDBError`
+- Extensive use of `Arc<RwLock<T>>` for shared state
+
+### 3. Error Handling Standards
+
+**Always:**
+- Use `thiserror` for custom error types
+- Propagate errors with `?` operator
+- Provide descriptive error messages
+- Include context in error chains
+
+**Error Type Pattern:**
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum BlockDBError {
+    #[error("Descriptive message: {0}")]
+    VariantName(String),
+    
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+```
+
+### 4. Configuration Management
+
+**Configuration Files:**
+- Use TOML format for all configuration
+- Environment variable overrides supported
+- Validation at application startup
+- Sensible defaults for all options
+
+**Pattern:**
+```toml
+[database]
+data_dir = "./blockdb_data"
+memtable_size_limit = 67108864  # Always include comments for clarity
+
+[cluster]
+node_id = "node1"
+# Timeouts in milliseconds
+heartbeat_interval = 150
+```
+
+### 5. Async/Sync Patterns
+
+**Synchronous (preferred for storage):**
+- Core storage operations
+- Local state management
+- File I/O operations
+
+**Asynchronous (required for distributed):**
+- Network communication
+- Consensus operations
+- Transaction coordination
+- HTTP API handlers
+
+**Pattern:**
+```rust
+// Async for distributed operations
+pub async fn distributed_operation(&self) -> Result<T, BlockDBError> {
+    // Implementation
+}
+
+// Sync for local operations
+pub fn local_operation(&self) -> Result<T, BlockDBError> {
+    // Implementation
+}
+```
+
+### 6. Testing Requirements
+
+**Every Change Must Include:**
+- Unit tests for new functionality
+- Integration tests for cross-component features
+- Performance benchmarks for critical paths
+- Error case coverage
+
+**Test Organization:**
+- Unit tests in `#[cfg(test)]` modules
+- Integration tests in `tests/` directory
+- Performance tests using `criterion`
+- Distributed tests with temporary clusters
+
+### 7. Performance Considerations
+
+**Optimize For:**
+- Write throughput (primary use case)
+- Memory efficiency
+- Minimal allocations in hot paths
+- Background compaction efficiency
+
+**Monitor:**
+- Memory usage patterns
+- Lock contention
+- Consensus latency
+- Storage overhead
+
+### 8. Documentation Standards
+
+**Required Documentation:**
+- All public APIs with examples
+- Complex algorithms explanation
+- Configuration option descriptions
+- Error condition documentation
+
+**Format:**
+```rust
+/// Brief description of function purpose
+///
+/// Detailed explanation of behavior, side effects, and important notes.
+///
+/// # Arguments
+///
+/// * `param1` - Description of parameter
+/// * `param2` - Description of parameter
+///
+/// # Returns
+///
+/// Returns `Ok(result)` on success, or specific error conditions.
+///
+/// # Errors
+///
+/// * `ErrorType::Variant` - When this error occurs
+///
+/// # Examples
+///
+/// ```rust
+/// let result = function_call(param1, param2)?;
+/// ```
+pub fn documented_function(&self, param1: Type1, param2: Type2) -> Result<ReturnType, BlockDBError> {
+    // Implementation
+}
+```
+
+### 9. Security Guidelines
+
+**Always:**
+- Use non-root user in containers
+- Validate all input data
+- Sanitize configuration values
+- Implement proper authentication for APIs
+
+**Never:**
+- Log sensitive information
+- Store secrets in configuration files
+- Allow buffer overflows (Rust prevents this)
+- Bypass cryptographic verification
+
+### 10. Container & Deployment Rules
+
+**Docker:**
+- Multi-stage builds for optimization
+- Health checks in all containers
+- Non-root user execution
+- Environment variable configuration
+- Persistent volume mounting
+
+**Kubernetes:**
+- StatefulSet for data persistence
+- Pod disruption budgets for HA
+- Resource limits and requests
+- Service mesh integration ready
+
+### 11. Blockchain Verification Rules
+
+**Critical Requirements:**
+- Every write operation MUST be verified
+- SHA-256 hashing for all blocks
+- Sequential block ordering
+- Integrity verification on startup
+
+**Pattern:**
+```rust
+// Every write must go through blockchain verification
+fn write_with_verification(&mut self, data: &[u8]) -> Result<(), BlockDBError> {
+    // 1. Write to WAL
+    self.wal.append(data)?;
+    
+    // 2. Update MemTable
+    self.memtable.insert(key, value)?;
+    
+    // 3. Add to blockchain
+    self.blockchain.add_block(data)?;
+    
+    Ok(())
+}
+```
+
+### 12. Consensus Implementation Rules
+
+**Raft Safety:**
+- Only leaders can accept writes
+- Log entries must be committed before application
+- Term changes invalidate ongoing operations
+- Network partitions must be handled gracefully
+
+**State Machine:**
+- Deterministic operation application
+- Consistent state across all nodes
+- Proper snapshot handling
+- Recovery from log replay
+
+### 13. Transaction Management
+
+**ACID Compliance:**
+- Atomicity: All operations in transaction succeed or fail together
+- Consistency: Database remains in valid state
+- Isolation: Concurrent transactions don't interfere
+- Durability: Committed changes are permanent
+
+**Lock Management:**
+- Fine-grained locking for performance
+- Deadlock detection and resolution
+- Timeout-based lock release
+- Priority-based lock acquisition
+
+### 14. API Design Principles
+
+**HTTP API:**
+- RESTful design patterns
+- JSON request/response format
+- Proper HTTP status codes
+- Comprehensive error responses
+
+**CLI Interface:**
+- Intuitive command structure
+- Detailed help messages
+- Progress indicators for long operations
+- Machine-readable output options
+
+### 15. Monitoring & Observability
+
+**Metrics:**
+- Operation counters and latencies
+- System resource usage
+- Cluster health indicators
+- Error rates and types
+
+**Logging:**
+- Structured logging with context
+- Configurable log levels
+- Separate logs for different components
+- JSON format for production
+
+### 16. Version Compatibility
+
+**Backwards Compatibility:**
+- API versioning for breaking changes
+- Configuration migration support
+- Data format evolution strategy
+- Rolling upgrade support
+
+**Upgrade Path:**
+- Graceful degradation for mixed versions
+- Feature flags for new capabilities
+- Rollback procedures for failures
+
+### 17. Code Quality Standards
+
+**Rust Patterns:**
+- Use `clippy` for code quality
+- Follow Rust naming conventions
+- Prefer `match` over `if let` for clarity
+- Use `?` operator for error propagation
+
+**Performance:**
+- Profile before optimizing
+- Benchmark critical paths
+- Monitor memory allocations
+- Optimize for the common case
+
+### 18. Development Workflow
+
+**Before Making Changes:**
+1. Read CLAUDE.md for project context
+2. Understand the affected components
+3. Plan changes to maintain consistency
+4. Consider impact on existing functionality
+
+**After Making Changes:**
+1. Run full test suite
+2. Update documentation
+3. Check performance impact
+4. Update configuration examples
+
+**Code Review Checklist:**
+- [ ] Maintains append-only guarantees
+- [ ] Preserves consensus safety
+- [ ] Includes comprehensive tests
+- [ ] Updates relevant documentation
+- [ ] Follows error handling patterns
+- [ ] Considers security implications
+
+### 19. Common Patterns to Follow
+
+**State Management:**
+```rust
+// Shared mutable state pattern
+pub struct Component {
+    state: Arc<RwLock<ComponentState>>,
+    config: ComponentConfig,
+}
+
+impl Component {
+    pub fn new(config: ComponentConfig) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(ComponentState::new())),
+            config,
+        }
+    }
+}
+```
+
+**Configuration Loading:**
+```rust
+// Configuration pattern
+#[derive(Deserialize, Clone)]
+pub struct Config {
+    #[serde(default = "default_value")]
+    pub field: Type,
+}
+
+fn default_value() -> Type {
+    // Sensible default
+}
+```
+
+**Error Context:**
+```rust
+// Error context pattern
+operation().map_err(|e| BlockDBError::OperationFailed {
+    operation: "operation_name".to_string(),
+    cause: e.to_string(),
+})?
+```
+
+### 20. AI Development Specific Rules
+
+**When Using AI Tools:**
+- Always maintain project architectural principles
+- Verify generated code matches existing patterns
+- Test thoroughly before committing
+- Document any architectural decisions
+- Consider long-term maintainability
+
+**Context Awareness:**
+- Understand the full system before making changes
+- Consider impact on distributed behavior
+- Maintain consistency with existing codebase
+- Follow established naming conventions
+
+This .cursorrules file ensures consistent AI-driven development while maintaining the integrity and design principles of BlockDB.

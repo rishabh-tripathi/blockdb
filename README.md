@@ -556,6 +556,22 @@ RUST_LOG=blockdb::consensus=trace ./target/release/blockdb-server
 3. **Network Latency**: Verify cluster network configuration
 4. **Consensus Delays**: Check leader election timeouts
 
+## 🤖 AI-First Development
+
+BlockDB is designed for AI-driven development and maintenance. This project includes comprehensive AI development infrastructure:
+
+### For AI Developers & LLMs
+- **[CLAUDE.md](./CLAUDE.md)** - Complete project context and architecture
+- **[AI_DEVELOPMENT.md](./AI_DEVELOPMENT.md)** - AI-specific development workflows  
+- **[.cursorrules](./.cursorrules)** - AI development guidelines and patterns
+
+### AI Development Features
+- Comprehensive context documentation for LLM understanding
+- Established code patterns for consistent AI-generated code
+- Automated testing workflows for AI development
+- Performance benchmarking templates
+- Documentation standards for AI maintenance
+
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.

@@ -240,6 +240,22 @@ journalctl -u blockdb -f
 ### Professional Support
 Contact information for enterprise support and consulting services will be provided as they become available.
 
+## 🤖 AI Development
+
+BlockDB is designed for AI-driven development and maintenance. For LLM/AI development workflows:
+
+### For AI Developers
+- **[AI Development Guide](../AI_DEVELOPMENT.md)** - Comprehensive AI development workflows
+- **[Project Context](../CLAUDE.md)** - Complete system understanding for AI
+- **[Cursor Rules](../.cursorrules)** - AI development guidelines and patterns
+
+### AI Development Features
+- Comprehensive context documentation for LLM understanding
+- Established patterns for consistent code generation
+- Automated testing workflows for AI-generated code
+- Performance benchmarking for AI optimizations
+- Documentation templates for AI-maintained features
+
 ---
 
 **Documentation Version**: 1.0  

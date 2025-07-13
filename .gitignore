@@ -1,0 +1,52 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Database data (don't commit test data)
+blockdb_data/
+test_*_data/
+*.db
+*.wal
+*.sst
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+test_*.py
+coverage/
+*.profraw
+
+# Backup files
+*.backup
+*.bak
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Environment files
+.env
+.env.local
+
+# Documentation build artifacts
+book/
+target-doc/
+
+# Benchmark results
+bench_results/
+flamegraph.svg
+perf.data*

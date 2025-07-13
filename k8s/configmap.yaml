@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blockdb-config
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: config
+data:
+  blockdb.toml: |
+    [database]
+    data_dir = "/var/lib/blockdb"
+    memtable_size_limit = 134217728  # 128MB for K8s
+    wal_sync_interval = 1000
+    compaction_threshold = 4
+    blockchain_batch_size = 1000
+
+    [server]
+    host = "0.0.0.0"
+    port = 8080
+    worker_threads = 4
+
+    [cluster]
+    node_id = "placeholder"  # Will be overridden by pod name
+    heartbeat_interval = 150
+    election_timeout = 300
+    enable_transactions = true
+    transaction_timeout = 30
+    peers = []  # Will be set via environment variables
+
+    [logging]
+    level = "info"
+    file = "/var/log/blockdb/blockdb.log"

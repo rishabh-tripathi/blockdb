@@ -31,6 +31,7 @@ cargo build --release
 - [API Documentation](#-api-documentation)
 - [Distributed Setup](#-distributed-setup)
 - [Configuration](#-configuration)
+- [Docker & Kubernetes](#-docker--kubernetes)
 - [Performance](#-performance)
 - [Contributing](#-contributing)
 - [License](#-license)
@@ -346,6 +347,53 @@ export BLOCKDB_LOG_LEVEL="debug"
 export BLOCKDB_SERVER_PORT="8080"
 export BLOCKDB_CLUSTER_ID="production-node-1"
 ```
+
+## 🐳 Docker & Kubernetes
+
+BlockDB provides comprehensive containerization support for easy deployment and scaling.
+
+### Quick Docker Start
+
+```bash
+# Build Docker image
+./scripts/docker-build.sh
+
+# Run single node
+docker-compose up -d
+
+# Run 3-node cluster with load balancer
+docker-compose -f docker-compose.cluster.yml up -d
+
+# Test cluster
+curl http://localhost:8080/health
+```
+
+### Kubernetes Deployment
+
+```bash
+# Deploy to Kubernetes
+./scripts/k8s-deploy.sh
+
+# Deploy to production environment
+./scripts/k8s-deploy.sh --environment production --namespace blockdb-prod
+
+# Scale cluster
+kubectl scale statefulset blockdb --replicas=5 -n blockdb
+
+# Port forward for local access
+./scripts/k8s-deploy.sh --port-forward
+```
+
+### Container Features
+
+- **Multi-stage builds** for optimized image size
+- **Health checks** and readiness probes
+- **StatefulSet** deployment for persistent storage
+- **Load balancing** with NGINX
+- **Auto-scaling** support
+- **Production-ready** configurations
+
+For detailed Docker and Kubernetes documentation, see [DOCKER.md](./DOCKER.md).
 
 ### Performance Tuning
 

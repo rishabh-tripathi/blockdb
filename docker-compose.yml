@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  blockdb:
+    build: .
+    image: blockdb:latest
+    container_name: blockdb-single
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - blockdb_data:/var/lib/blockdb
+      - blockdb_logs:/var/log/blockdb
+    environment:
+      - BLOCKDB_NODE_ID=node1
+      - BLOCKDB_HOST=0.0.0.0
+      - BLOCKDB_PORT=8080
+      - BLOCKDB_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - blockdb-network
+
+  # Optional: Web UI or monitoring (placeholder for future)
+  # blockdb-ui:
+  #   image: blockdb-ui:latest
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - BLOCKDB_API_URL=http://blockdb:8080
+  #   depends_on:
+  #     - blockdb
+  #   networks:
+  #     - blockdb-network
+
+volumes:
+  blockdb_data:
+    driver: local
+  blockdb_logs:
+    driver: local
+
+networks:
+  blockdb-network:
+    driver: bridge

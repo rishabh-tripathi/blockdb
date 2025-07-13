@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: blockdb-pdb
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+spec:
+  minAvailable: 2  # Ensure at least 2 nodes are available (quorum)
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blockdb
+      app.kubernetes.io/component: database

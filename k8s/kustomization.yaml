@@ -1,0 +1,83 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: blockdb
+  namespace: blockdb
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/name: blockdb
+  app.kubernetes.io/version: "0.1.0"
+  app.kubernetes.io/managed-by: kustomize
+
+# Common annotations
+commonAnnotations:
+  deployment.kubernetes.io/revision: "1"
+
+# Namespace for all resources
+namespace: blockdb
+
+# Resources to include
+resources:
+- namespace.yaml
+- rbac.yaml
+- configmap.yaml
+- statefulset.yaml
+- service.yaml
+- pdb.yaml
+- ingress.yaml
+
+# Images to customize
+images:
+- name: blockdb
+  newTag: latest
+  # newName: your-registry/blockdb  # Uncomment to use custom registry
+
+# ConfigMap generator for additional configs
+configMapGenerator:
+- name: blockdb-env-config
+  literals:
+  - ENVIRONMENT=production
+  - LOG_LEVEL=info
+  - CLUSTER_SIZE=3
+
+# Secret generator for sensitive data
+secretGenerator:
+- name: blockdb-secrets
+  literals:
+  - database-password=changeme
+  - jwt-secret=your-jwt-secret-here
+  type: Opaque
+
+# Patches for different environments
+patchesStrategicMerge:
+- |-
+  # Production resource adjustments
+  apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: blockdb
+  spec:
+    template:
+      spec:
+        containers:
+        - name: blockdb
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+
+# Replicas
+replicas:
+- name: blockdb
+  count: 3
+
+# Name prefix for all resources
+namePrefix: ""
+
+# Name suffix for all resources  
+nameSuffix: ""

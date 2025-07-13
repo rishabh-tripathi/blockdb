@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: blockdb
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+spec:
+  serviceName: blockdb-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blockdb
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blockdb
+        app.kubernetes.io/component: database
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: blockdb
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+      - name: init-blockdb
+        image: busybox:1.35
+        command:
+        - sh
+        - -c
+        - |
+          # Create directories and set permissions
+          mkdir -p /var/lib/blockdb /var/log/blockdb
+          chown -R 1000:1000 /var/lib/blockdb /var/log/blockdb
+          chmod 755 /var/lib/blockdb /var/log/blockdb
+        volumeMounts:
+        - name: blockdb-data
+          mountPath: /var/lib/blockdb
+        - name: blockdb-logs
+          mountPath: /var/log/blockdb
+        securityContext:
+          runAsUser: 0
+      containers:
+      - name: blockdb
+        image: blockdb:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: BLOCKDB_NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: BLOCKDB_HOST
+          value: "0.0.0.0"
+        - name: BLOCKDB_PORT
+          value: "8080"
+        - name: BLOCKDB_LOG_LEVEL
+          value: "info"
+        - name: BLOCKDB_PEERS
+          value: "blockdb-0.blockdb-headless.blockdb.svc.cluster.local:8080,blockdb-1.blockdb-headless.blockdb.svc.cluster.local:8080,blockdb-2.blockdb-headless.blockdb.svc.cluster.local:8080"
+        - name: BLOCKDB_MEMTABLE_SIZE
+          value: "134217728"  # 128MB
+        volumeMounts:
+        - name: blockdb-data
+          mountPath: /var/lib/blockdb
+        - name: blockdb-logs
+          mountPath: /var/log/blockdb
+        - name: config
+          mountPath: /etc/blockdb
+          readOnly: true
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: config
+        configMap:
+          name: blockdb-config
+      - name: blockdb-logs
+        emptyDir: {}
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+  - metadata:
+      name: blockdb-data
+      labels:
+        app.kubernetes.io/name: blockdb
+        app.kubernetes.io/component: database
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+      # storageClassName: fast-ssd  # Uncomment and specify your storage class

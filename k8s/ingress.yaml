@@ -1,0 +1,118 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: blockdb-ingress
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+  annotations:
+    # NGINX Ingress Controller
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    
+    # Load balancing
+    nginx.ingress.kubernetes.io/load-balance: "round_robin"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+    
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    
+    # Body size (for large payloads)
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    
+    # Rate limiting (adjust as needed)
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    
+    # Certificate management (uncomment if using cert-manager)
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    
+    # Alternative: Traefik annotations
+    # traefik.ingress.kubernetes.io/router.tls: "true"
+    # traefik.ingress.kubernetes.io/router.middlewares: "blockdb-auth@kubernetescrd"
+    
+    # Alternative: AWS ALB annotations
+    # kubernetes.io/ingress.class: "alb"
+    # alb.ingress.kubernetes.io/scheme: "internet-facing"
+    # alb.ingress.kubernetes.io/target-type: "ip"
+    # alb.ingress.kubernetes.io/load-balancer-name: "blockdb-alb"
+    # alb.ingress.kubernetes.io/healthcheck-path: "/health"
+spec:
+  ingressClassName: nginx  # Adjust based on your ingress controller
+  
+  # TLS configuration
+  tls:
+  - hosts:
+    - blockdb.example.com
+    secretName: blockdb-tls-secret
+  
+  rules:
+  - host: blockdb.example.com
+    http:
+      paths:
+      # API endpoints
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: blockdb
+            port:
+              number: 8080
+      
+      # Health checks
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: blockdb
+            port:
+              number: 8080
+      
+      # Metrics (restrict access as needed)
+      - path: /metrics
+        pathType: Exact
+        backend:
+          service:
+            name: blockdb
+            port:
+              number: 9090
+      
+      # Cluster management
+      - path: /cluster
+        pathType: Prefix
+        backend:
+          service:
+            name: blockdb
+            port:
+              number: 8080
+      
+      # Default catch-all
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: blockdb
+            port:
+              number: 8080
+
+---
+# TLS Secret (create manually or via cert-manager)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: blockdb-tls-secret
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+type: kubernetes.io/tls
+data:
+  # Base64 encoded certificate and key
+  # Replace with your actual certificate data
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t...
+  tls.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t...

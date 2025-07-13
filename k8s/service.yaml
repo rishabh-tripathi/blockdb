@@ -1,0 +1,81 @@
+---
+# Headless service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockdb-headless
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+    service-type: headless
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: metrics
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+
+---
+# Load balancer service
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockdb
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+    service-type: loadbalancer
+  annotations:
+    # Add cloud provider specific annotations here
+    # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: metrics
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 300
+
+---
+# External service (optional - for testing)
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockdb-external
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+    service-type: external
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database

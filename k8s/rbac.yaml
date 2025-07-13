@@ -1,0 +1,57 @@
+---
+# Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blockdb
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+automountServiceAccountToken: true
+
+---
+# Role for BlockDB operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blockdb
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+
+---
+# Role binding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blockdb
+  namespace: blockdb
+  labels:
+    app.kubernetes.io/name: blockdb
+    app.kubernetes.io/component: database
+subjects:
+- kind: ServiceAccount
+  name: blockdb
+  namespace: blockdb
+roleRef:
+  kind: Role
+  name: blockdb
+  apiGroup: rbac.authorization.k8s.io

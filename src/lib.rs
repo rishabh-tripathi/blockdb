@@ -4,6 +4,7 @@ pub mod error;
 pub mod consensus;
 pub mod transaction;
 pub mod distributed;
+// pub mod auth;  // Temporarily disabled due to dependency conflicts
 
 pub use storage::{BlockDB, BlockDBConfig, Record};
 pub use api::{BlockDBServer, ApiConfig};
@@ -11,6 +12,7 @@ pub use error::BlockDBError;
 pub use distributed::{DistributedBlockDB, DistributedBlockDBConfig};
 pub use transaction::{TransactionManager, TransactionId, Operation};
 pub use consensus::{NodeId, NodeAddress, ClusterConfig};
+// pub use auth::{AuthManager, AuthConfig, AuthContext, AuthError, Permission, PermissionSet, CryptoIdentity, AuthenticatedDistributedBlockDB, AuthenticatedDistributedBlockDBConfig};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

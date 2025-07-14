@@ -37,7 +37,7 @@ impl NodeAddress {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
     pub node_id: NodeId,
     pub address: NodeAddress,

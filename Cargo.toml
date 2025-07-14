@@ -46,4 +46,4 @@ path = "src/bin/server.rs"
 
 [[bin]]
 name = "blockdb-cli"
-path = "src/bin/cli.rs"
+path = "src/bin/simple_cli.rs"

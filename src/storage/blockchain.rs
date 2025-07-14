@@ -255,4 +255,20 @@ impl BlockChain {
         
         proof
     }
+
+    /// Clear all blockchain data and reset to genesis block
+    pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Clear all blocks and pending records
+        self.blocks.clear();
+        self.pending_records.clear();
+        
+        // Create new genesis block
+        let genesis_block = Block::new(0, vec![0u8; 32], Vec::new());
+        self.blocks.push(genesis_block);
+        
+        // Save to disk
+        self.save_to_disk()?;
+        
+        Ok(())
+    }
 }

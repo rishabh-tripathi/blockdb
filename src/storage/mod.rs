@@ -12,6 +12,7 @@ pub mod memtable;
 pub mod sstable;
 pub mod blockchain;
 pub mod compaction;
+pub mod collection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -26,7 +27,7 @@ pub struct Record {
 pub struct BlockDBConfig {
     pub data_dir: String,
     pub memtable_size_limit: usize,
-    pub wal_sync_interval: u64,
+    pub wal_sync_interval_ms: u64,
     pub compaction_threshold: usize,
     pub blockchain_batch_size: usize,
 }
@@ -36,7 +37,7 @@ impl Default for BlockDBConfig {
         Self {
             data_dir: "./blockdb_data".to_string(),
             memtable_size_limit: 64 * 1024 * 1024, // 64MB
-            wal_sync_interval: 1000, // 1 second
+            wal_sync_interval_ms: 1000, // 1 second
             compaction_threshold: 4,
             blockchain_batch_size: 1000,
         }
@@ -223,5 +224,57 @@ impl BlockDB {
     pub fn verify_integrity(&self) -> Result<bool, Box<dyn std::error::Error>> {
         let blockchain = self.blockchain.lock().unwrap();
         blockchain.verify_chain()
+    }
+
+    /// Flush all data and reset the database to an empty state
+    pub fn flush_all(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Clear memtable
+        {
+            let mut memtable = self.memtable.write().unwrap();
+            *memtable = memtable::MemTable::new();
+        }
+
+        // Clear WAL
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.clear()?;
+        }
+
+        // Clear SSTables
+        {
+            let mut sstables = self.sstables.write().unwrap();
+            // Remove all SSTable files
+            for sstable in sstables.drain(..) {
+                let _ = std::fs::remove_file(sstable.path());
+            }
+        }
+
+        // Clear blockchain
+        {
+            let mut blockchain = self.blockchain.lock().unwrap();
+            blockchain.clear()?;
+        }
+
+        // Reset sequence counter
+        {
+            let mut counter = self.sequence_counter.lock().unwrap();
+            *counter = 0;
+        }
+
+        println!("✅ Database flushed successfully - all data cleared");
+        Ok(())
+    }
+
+    /// Force flush memtable to disk
+    pub fn force_flush_memtable(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let memtable = self.memtable.read().unwrap();
+        if !memtable.is_empty() {
+            drop(memtable);
+            self.flush_memtable()?;
+            println!("✅ Memtable flushed to disk");
+        } else {
+            println!("ℹ️ Memtable is empty, nothing to flush");
+        }
+        Ok(())
     }
 }

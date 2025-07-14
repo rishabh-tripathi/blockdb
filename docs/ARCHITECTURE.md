@@ -20,6 +20,14 @@ BlockDB is a distributed, append-only database designed for high-throughput writ
 └─────────────────────┬───────────────────────────────────────┘
                      │
 ┌─────────────────────┴───────────────────────────────────────┐
+│                 Collection Manager                         │
+│  ┌─────────────────┬─────────────────┬─────────────────┐   │
+│  │   Collection    │   Schema &      │   Index         │   │
+│  │   Lifecycle     │   Validation    │   Management    │   │
+│  └─────────────────┴─────────────────┴─────────────────┘   │
+└─────────────────────┬───────────────────────────────────────┘
+                     │
+┌─────────────────────┴───────────────────────────────────────┐
 │                 Distributed Layer                          │
 │  ┌─────────────────┬─────────────────┬─────────────────┐   │
 │  │   Consensus     │   Transactions  │   Cluster Mgmt  │   │
@@ -50,14 +58,21 @@ BlockDB is a distributed, append-only database designed for high-throughput writ
 - **Request Validation**: Input validation and sanitization
 - **Response Formatting**: Consistent response formats across interfaces
 
-#### 2. Distributed Layer
+#### 2. Collection Manager
+- **Multi-Collection Support**: Multiple collections per database node
+- **Schema Management**: Field validation and schema enforcement
+- **Index Management**: Multi-field indexes with unique constraints
+- **Data Isolation**: Complete separation between collections
+- **Metadata Management**: Collection statistics and configuration
+
+#### 3. Distributed Layer
 - **Consensus Management**: Raft algorithm for distributed coordination
 - **Transaction Coordination**: ACID transaction support with 2PC
 - **Cluster Management**: Node discovery, health monitoring, membership
 - **Load Balancing**: Request distribution across cluster nodes
 - **Fault Tolerance**: Automatic failover and recovery
 
-#### 3. Storage Engine
+#### 4. Storage Engine
 - **MemTable**: In-memory write buffer for recent operations
 - **SSTable Management**: Persistent sorted string tables
 - **Blockchain Integration**: Cryptographic verification chain
@@ -70,6 +85,195 @@ BlockDB is a distributed, append-only database designed for high-throughput writ
 - **File Management**: Efficient disk I/O and file organization
 
 ## Core Components
+
+### 0. Collection System
+
+BlockDB implements a comprehensive collection system that enables multiple logical data containers within a single database node, providing complete isolation and independent management.
+
+#### Collection Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Collection Manager                        │
+│  ┌─────────────────┬─────────────────┬─────────────────┐   │
+│  │   Collection    │   Metadata      │   Index         │   │
+│  │   Registry      │   Store         │   Manager       │   │
+│  └─────────────────┴─────────────────┴─────────────────┘   │
+└─────────────────────┬───────────────────────────────────────┘
+                     │
+       ┌─────────────┼─────────────┐
+       │             │             │
+       ▼             ▼             ▼
+┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+│Collection A │ │Collection B │ │Collection C │
+│             │ │             │ │             │
+│ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │
+│ │BlockDB  │ │ │ │BlockDB  │ │ │ │BlockDB  │ │
+│ │Instance │ │ │ │Instance │ │ │ │Instance │ │
+│ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │
+│             │ │             │ │             │
+│ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │
+│ │Indexes  │ │ │ │Indexes  │ │ │ │Indexes  │ │
+│ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │
+│             │ │             │ │             │
+│ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │
+│ │Metadata │ │ │ │Metadata │ │ │ │Metadata │ │
+│ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │
+└─────────────┘ └─────────────┘ └─────────────┘
+```
+
+#### Collection Manager
+
+The Collection Manager coordinates all collection operations within a single database node:
+
+```rust
+pub struct CollectionManager {
+    collections: Arc<RwLock<HashMap<CollectionId, Collection>>>,
+    metadata_store: Arc<RwLock<HashMap<CollectionId, CollectionMetadata>>>,
+    config: BlockDBConfig,
+    default_collection: Option<CollectionId>,
+}
+```
+
+**Key Features:**
+- **Collection Registry**: Tracks all active collections
+- **Metadata Persistence**: Stores collection configuration and statistics
+- **Resource Management**: Coordinates storage and memory usage
+- **Concurrent Access**: Thread-safe collection operations
+
+#### Collection Structure
+
+Each collection is an independent database instance with its own storage:
+
+```rust
+pub struct Collection {
+    pub metadata: Arc<RwLock<CollectionMetadata>>,
+    pub storage: Arc<RwLock<BlockDB>>,
+    pub indexes: Arc<RwLock<HashMap<String, Vec<Vec<u8>>>>>,
+}
+```
+
+**Isolation Guarantees:**
+- **Physical Isolation**: Separate storage directories per collection
+- **Logical Isolation**: Independent BlockDB instances
+- **Index Isolation**: Per-collection index management
+- **Metadata Isolation**: Separate statistics and configuration
+
+#### Collection Metadata
+
+Rich metadata system for collection management:
+
+```rust
+pub struct CollectionMetadata {
+    pub id: CollectionId,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: u64,
+    pub created_by: Option<String>,
+    pub schema: Option<CollectionSchema>,
+    pub settings: CollectionSettings,
+    pub stats: CollectionStats,
+}
+```
+
+**Metadata Features:**
+- **Identity**: Unique ID and human-readable name
+- **Timestamps**: Creation and modification tracking
+- **Ownership**: User attribution for collections
+- **Configuration**: Per-collection settings and policies
+
+#### Schema System
+
+Optional schema enforcement for data validation:
+
+```rust
+pub struct CollectionSchema {
+    pub version: u32,
+    pub fields: HashMap<String, FieldDefinition>,
+    pub required_fields: Vec<String>,
+    pub indexes: Vec<IndexDefinition>,
+}
+
+pub struct FieldDefinition {
+    pub field_type: FieldType,
+    pub required: bool,
+    pub default_value: Option<String>,
+    pub validation_rules: Vec<ValidationRule>,
+}
+```
+
+**Schema Capabilities:**
+- **Field Types**: String, Integer, Float, Boolean, Array, Object, Binary, Timestamp
+- **Validation Rules**: MinLength, MaxLength, Pattern, MinValue, MaxValue, OneOf
+- **Required Fields**: Mandatory field enforcement
+- **Schema Versioning**: Evolution support for backward compatibility
+
+#### Index Management
+
+Multi-field indexes with advanced features:
+
+```rust
+pub struct IndexDefinition {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub unique: bool,
+    pub sparse: bool,
+}
+```
+
+**Index Features:**
+- **Multi-Field**: Composite indexes on multiple fields
+- **Unique Constraints**: Prevent duplicate values
+- **Sparse Indexes**: Skip documents missing indexed fields
+- **Dynamic Management**: Runtime index creation and deletion
+
+#### Storage Layout
+
+Collections are organized in a hierarchical directory structure:
+
+```
+{data_dir}/
+├── collections/
+│   ├── col_uuid_1/
+│   │   ├── metadata.toml          # Collection configuration
+│   │   ├── wal.log                # Write-ahead log
+│   │   ├── blockchain.dat         # Blockchain verification
+│   │   ├── sstable_*.sst          # Sorted string tables
+│   │   └── indexes/
+│   │       ├── index_1.idx        # Index files
+│   │       └── index_2.idx
+│   ├── col_uuid_2/
+│   │   ├── metadata.toml
+│   │   ├── wal.log
+│   │   ├── blockchain.dat
+│   │   ├── sstable_*.sst
+│   │   └── indexes/
+│   │       └── index_1.idx
+│   └── ...
+└── global_metadata/
+    ├── collections.toml           # Collection registry
+    └── cluster_config.toml        # Cluster configuration
+```
+
+#### Collection Operations Flow
+
+**Collection Creation:**
+```
+Client Request → Manager → Metadata Creation → Storage Directory → 
+Configuration Persistence → Collection Registration → Success Response
+```
+
+**Data Operations:**
+```
+Client Request → Collection Resolution → Schema Validation → 
+Storage Operation → Index Updates → Statistics Update → Response
+```
+
+**Collection Deletion:**
+```
+Client Request → Collection Lookup → Resource Cleanup → 
+Storage Deletion → Metadata Removal → Success Response
+```
 
 ### 1. Storage Engine
 
@@ -275,7 +479,7 @@ pub struct WALEntry {
 
 ## Data Flow
 
-### Write Path
+### Collection Write Path
 
 ```
 Client Write Request
@@ -283,6 +487,16 @@ Client Write Request
         ▼
 ┌─────────────────┐
 │  Input Valid.   │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│Collection Lookup│ ◄── Resolve Collection ID
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│Schema Validation│ ◄── Validate against schema
 └─────────┬───────┘
           │
           ▼
@@ -298,6 +512,16 @@ Client Write Request
           ▼
 ┌─────────────────┐
 │ MemTable Insert │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│  Index Update   │ ◄── Update collection indexes
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Stats Update    │ ◄── Update collection statistics
 └─────────┬───────┘
           │
           ▼
@@ -321,7 +545,7 @@ Client Write Request
 └─────────────────┘
 ```
 
-### Read Path
+### Collection Read Path
 
 ```
 Client Read Request
@@ -329,6 +553,11 @@ Client Read Request
         ▼
 ┌─────────────────┐
 │  Input Valid.   │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│Collection Lookup│ ◄── Resolve Collection ID
 └─────────┬───────┘
           │
           ▼
@@ -344,6 +573,48 @@ Client Read Request
           ▼
 ┌─────────────────┐
 │ Return Result   │
+└─────────────────┘
+```
+
+### Collection Management Flow
+
+```
+Create Collection Request
+        │
+        ▼
+┌─────────────────┐
+│  Input Valid.   │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Name Uniqueness │ ◄── Check for duplicate names
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│Generate ID & Dir│ ◄── Create unique collection ID
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Create Storage  │ ◄── Initialize BlockDB instance
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│Save Metadata    │ ◄── Persist collection config
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│Register with    │ ◄── Add to collection registry
+│   Manager       │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Success Return  │
 └─────────────────┘
 ```
 
@@ -437,7 +708,29 @@ Client → Leader → Consensus → Storage
 - **Block Structure**: Merkle trees for efficiency
 - **Batch Size**: Configurable for performance tuning
 
-### 5. ACID Transactions
+### 5. Collection-Based Organization
+
+**Decision**: Implement collection system for data organization.
+
+**Rationale**:
+- **Multi-Tenancy**: Logical data separation for different applications
+- **Schema Isolation**: Different validation rules per collection
+- **Performance Isolation**: Independent storage and indexing
+- **Operational Flexibility**: Per-collection configuration and monitoring
+
+**Implementation**:
+- **Collection Manager**: Central coordination of all collections
+- **Physical Isolation**: Separate storage directories
+- **Metadata Management**: Rich collection metadata and statistics
+- **Schema System**: Optional data validation per collection
+
+**Use Cases**:
+- **Multi-Tenant SaaS**: Separate customer data
+- **Microservices**: Domain-specific data organization
+- **E-commerce**: Users, orders, products in separate collections
+- **Event Sourcing**: Events and snapshots in different collections
+
+### 6. ACID Transactions
 
 **Decision**: Provide full ACID transaction support.
 
@@ -488,6 +781,8 @@ Client → Leader → Consensus → Storage
 **Index Cache**: 10-20% of SSTable size
 **Transaction State**: ~1KB per active transaction
 **Consensus State**: ~10MB for cluster metadata
+**Collection Overhead**: ~5-10MB per collection (metadata + indexes)
+**Collection Manager**: ~1MB base + ~1KB per collection
 
 ### Storage Overhead
 
@@ -576,6 +871,13 @@ Client → Leader → Consensus → Storage
 - Node health and connectivity
 - Consensus latency
 - Transaction success/failure rates
+
+**Collection Metrics**:
+- Documents per collection
+- Collection size and growth rate
+- Index utilization and performance
+- Schema validation success/failure rates
+- Per-collection operation latency
 
 ### Health Checks
 

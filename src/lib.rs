@@ -47,9 +47,14 @@ impl BlockDBHandle {
     }
 
     pub async fn force_flush(&self) -> Result<(), BlockDBError> {
-        let _db = self.db.write().await;
-        // Force flush implementation would go here
-        Ok(())
+        let db = self.db.write().await;
+        db.force_flush_memtable().map_err(BlockDBError::from)
+    }
+
+    /// Flush all data in the database (dangerous - clears everything)
+    pub async fn flush_all(&self) -> Result<(), BlockDBError> {
+        let db = self.db.write().await;
+        db.flush_all().map_err(BlockDBError::from)
     }
 }
 

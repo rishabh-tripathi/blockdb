@@ -45,6 +45,14 @@ cargo build --release
 - **LSM-Tree Storage**: Memory-mapped tables with efficient compaction
 - **Write-Ahead Logging**: Durability and crash recovery
 
+### Collection System Features
+- **Multi-Collection Support**: Multiple logical data containers per node
+- **Data Isolation**: Complete physical and logical separation between collections
+- **Schema Management**: Optional field validation and type checking
+- **Index Support**: Multi-field indexes with unique constraints
+- **Collection Metadata**: Rich statistics and configuration per collection
+- **Tenant-Safe**: Perfect for multi-tenant applications
+
 ### Distributed System Features
 - **Raft Consensus**: Leader election and log replication
 - **ACID Transactions**: Full transaction support with 2PC
@@ -68,6 +76,12 @@ BlockDB implements a layered architecture designed for scalability and reliabili
 ├─────────────────────────────────────────────────────────────┤
 │                    API Layer (HTTP/CLI)                    │
 ├─────────────────────────────────────────────────────────────┤
+│                   Collection Manager                       │
+│  ┌─────────────────┬─────────────────┬─────────────────┐   │
+│  │   Collections   │   Schema &      │   Index         │   │
+│  │   Registry      │   Validation    │   Management    │   │
+│  └─────────────────┴─────────────────┴─────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
 │                  Distributed Database                      │
 │  ┌─────────────────┬─────────────────┬─────────────────┐   │
 │  │   Consensus     │   Transactions  │   Cluster Mgmt  │   │
@@ -86,19 +100,25 @@ BlockDB implements a layered architecture designed for scalability and reliabili
 
 ### Key Components
 
-#### 1. Storage Layer
+#### 1. Collection Layer
+- **Collection Manager**: Coordinates multiple collections per node
+- **Schema Validation**: Optional field validation and type checking
+- **Index Management**: Multi-field indexes with unique constraints
+- **Metadata Store**: Rich statistics and configuration per collection
+
+#### 2. Storage Layer
 - **MemTable**: In-memory sorted map for recent writes
 - **SSTable**: Disk-based sorted string tables for persistence
 - **WAL**: Write-ahead log for durability and recovery
 - **Blockchain**: Cryptographic verification chain
 
-#### 2. Distributed Layer
+#### 3. Distributed Layer
 - **Raft Consensus**: Distributed consensus algorithm
 - **Transaction Manager**: ACID transaction coordination
 - **Lock Manager**: Fine-grained locking with deadlock detection
 - **Cluster Manager**: Node discovery and health monitoring
 
-#### 3. API Layer
+#### 4. API Layer
 - **CLI Interface**: Command-line tools for operations
 - **HTTP Server**: RESTful API endpoints (planned)
 - **gRPC Service**: High-performance RPC interface (planned)
@@ -166,15 +186,44 @@ echo "binary content" | base64 | xargs ./target/release/blockdb-cli put "binary:
 ./target/release/blockdb-cli get "binary:key" --base64 | base64 -d
 ```
 
-### 3. Interactive Mode
+### 3. Working with Collections
+
+```bash
+# Create collections for different data domains
+./target/release/blockdb-cli collection create users --description "User data"
+./target/release/blockdb-cli collection create orders --description "Order data"
+./target/release/blockdb-cli collection create products --description "Product catalog"
+
+# List all collections
+./target/release/blockdb-cli collection list
+
+# Store data in specific collections
+./target/release/blockdb-cli collection put col_users "user:1001" "Alice Smith"
+./target/release/blockdb-cli collection put col_orders "order:2001" "laptop,mouse,keyboard"
+./target/release/blockdb-cli collection put col_products "prod:3001" "MacBook Pro 16\""
+
+# Retrieve data from collections
+./target/release/blockdb-cli collection get col_users "user:1001"
+./target/release/blockdb-cli collection get col_orders "order:2001"
+
+# Collection statistics
+./target/release/blockdb-cli collection stats col_users
+
+# Verify collection integrity
+./target/release/blockdb-cli collection verify col_users
+```
+
+### 4. Interactive Mode
 
 ```bash
 # Start interactive session
 ./target/release/blockdb-cli interactive
 
 # Interactive commands
-> put user:1003 "Alice Johnson"
-> get user:1003
+> collection create users
+> collection put col_123 user:1003 "Alice Johnson"
+> collection get col_123 user:1003
+> collection list
 > verify
 > stats
 > exit
@@ -237,6 +286,34 @@ blockdb-cli verify
 Example Output:
   Verifying blockchain integrity...
   ✓ Blockchain integrity verified successfully
+```
+
+##### COLLECTION - Collection Management
+```bash
+# Create collection
+blockdb-cli collection create <NAME> [--description <DESC>]
+
+# List collections
+blockdb-cli collection list
+
+# Drop collection
+blockdb-cli collection drop <COLLECTION_ID>
+
+# Collection operations
+blockdb-cli collection put <COLLECTION_ID> <KEY> <VALUE>
+blockdb-cli collection get <COLLECTION_ID> <KEY>
+blockdb-cli collection stats <COLLECTION_ID>
+blockdb-cli collection verify <COLLECTION_ID>
+
+# Index management
+blockdb-cli collection create-index <COLLECTION_ID> <INDEX_NAME> --fields <FIELDS>
+blockdb-cli collection drop-index <COLLECTION_ID> <INDEX_NAME>
+
+Examples:
+  blockdb-cli collection create users --description "User data"
+  blockdb-cli collection put col_123 "user:1001" "Alice Smith"
+  blockdb-cli collection get col_123 "user:1001"
+  blockdb-cli collection create-index col_123 email_idx --fields email --unique
 ```
 
 ##### INTERACTIVE - Interactive Mode
@@ -465,6 +542,21 @@ GET  /api/v1/get/{key}
 POST /api/v1/batch
 ```
 
+#### Collection Operations
+```
+POST   /api/v1/collections
+GET    /api/v1/collections
+GET    /api/v1/collections/{collection_id}
+DELETE /api/v1/collections/{collection_id}
+POST   /api/v1/collections/{collection_id}/documents
+GET    /api/v1/collections/{collection_id}/documents/{key}
+GET    /api/v1/collections/{collection_id}/documents
+POST   /api/v1/collections/{collection_id}/indexes
+DELETE /api/v1/collections/{collection_id}/indexes/{index_name}
+GET    /api/v1/collections/{collection_id}/stats
+POST   /api/v1/collections/{collection_id}/verify
+```
+
 #### Cluster Management
 ```
 GET    /cluster/status
@@ -505,6 +597,47 @@ curl -X POST http://localhost:8080/api/v1/batch \
       {"type": "put", "key": "user:1002", "value": "Jane Smith"}
     ]
   }'
+```
+
+#### Collection Operations
+
+##### Create Collection
+```bash
+curl -X POST http://localhost:8080/api/v1/collections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "users",
+    "description": "User data collection",
+    "schema": {
+      "version": 1,
+      "fields": {
+        "email": {"field_type": "String", "required": true}
+      },
+      "required_fields": ["email"]
+    }
+  }'
+```
+
+##### List Collections
+```bash
+curl http://localhost:8080/api/v1/collections
+```
+
+##### Store Data in Collection
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/col_123/documents \
+  -H "Content-Type: application/json" \
+  -d '{"key": "user:1001", "value": "alice@example.com"}'
+```
+
+##### Get Data from Collection
+```bash
+curl http://localhost:8080/api/v1/collections/col_123/documents/user:1001
+```
+
+##### Collection Statistics
+```bash
+curl http://localhost:8080/api/v1/collections/col_123/stats
 ```
 
 ## 🐛 Troubleshooting

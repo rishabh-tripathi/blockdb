@@ -84,4 +84,14 @@ impl WriteAheadLog {
         self.file.get_mut().sync_all()?;
         Ok(())
     }
+
+    /// Clear all WAL data and reset to empty state
+    pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Truncate the file to zero length
+        self.file.get_mut().set_len(0)?;
+        self.file.get_mut().seek(SeekFrom::Start(0))?;
+        self.file.flush()?;
+        self.offset = 0;
+        Ok(())
+    }
 }

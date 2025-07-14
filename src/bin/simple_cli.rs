@@ -1,5 +1,5 @@
 use blockdb::{BlockDBConfig, BlockDBHandle};
-use blockdb::storage::collection::{CollectionManager, CollectionSchema, CollectionSettings, IndexDefinition};
+use blockdb::storage::collection::{CollectionManager, IndexDefinition};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use base64::Engine;
@@ -29,7 +29,6 @@ enum Commands {
     },
     Stats,
     Verify,
-    Interactive,
     Flush {
         #[arg(long)]
         force: bool,
@@ -38,6 +37,7 @@ enum Commands {
         #[command(subcommand)]
         action: CollectionAction,
     },
+    Interactive,
 }
 
 #[derive(Subcommand, Debug)]
@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("BlockDB Statistics:");
             println!("  Data directory: {}", config.data_dir);
             println!("  Memtable size limit: {} MB", config.memtable_size_limit / 1024 / 1024);
-            println!("  WAL sync interval: {} ms", config.wal_sync_interval);
+            println!("  WAL sync interval: {} ms", config.wal_sync_interval_ms);
             println!("  Compaction threshold: {}", config.compaction_threshold);
             println!("  Blockchain batch size: {}", config.blockchain_batch_size);
         }

@@ -34,7 +34,12 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3.8"
-criterion = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.0"
+tokio-test = "0.4"
+futures = "0.3"
+fastrand = "2.0"
+rand = "0.8"
 
 [lib]
 name = "blockdb"
@@ -47,3 +52,7 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "blockdb-cli"
 path = "src/bin/simple_cli.rs"
+
+[[bench]]
+name = "comprehensive_benchmarks"
+harness = false

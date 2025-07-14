@@ -1,13 +1,13 @@
-# BlockDB Docker Configuration
+# BlockDB Configuration
 [database]
-data_dir = "/var/lib/blockdb"
+data_dir = "./blockdb_data"
 memtable_size_limit = 67108864  # 64MB
-wal_sync_interval = 1000
+wal_sync_interval = 1000        # milliseconds
 compaction_threshold = 4
 blockchain_batch_size = 1000
 
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8080
 worker_threads = 4
 
@@ -23,14 +23,17 @@ admin_users = ["admin"]
 
 [cluster]
 node_id = "node1"
-heartbeat_interval = 150
-election_timeout = 300
+heartbeat_interval = 150        # milliseconds
+election_timeout = 300          # milliseconds
 enable_transactions = true
-transaction_timeout = 30
-
-# Cluster peers (will be overridden by environment variables)
-peers = []
+transaction_timeout = 30        # seconds
 
 [logging]
 level = "info"
-file = "/var/log/blockdb/blockdb.log"
+file = "./logs/blockdb.log"
+
+[api]
+enable_cors = true
+enable_compression = true
+max_connections = 1000
+request_timeout = 30            # seconds

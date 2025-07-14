@@ -9,7 +9,7 @@ pub enum BlockDBError {
     StorageError(String),
     ApiError(String),
     DuplicateKey(String),
-    // AuthError(crate::auth::AuthError),
+    AuthError(crate::auth::AuthError),
     ConsensusError(String),
     TransactionError(String),
 }
@@ -24,7 +24,7 @@ impl fmt::Display for BlockDBError {
             BlockDBError::StorageError(msg) => write!(f, "Storage Error: {}", msg),
             BlockDBError::ApiError(msg) => write!(f, "API Error: {}", msg),
             BlockDBError::DuplicateKey(msg) => write!(f, "Duplicate Key Error: {}", msg),
-            // BlockDBError::AuthError(e) => write!(f, "Authentication Error: {}", e),
+            BlockDBError::AuthError(e) => write!(f, "Authentication Error: {}", e),
             BlockDBError::ConsensusError(msg) => write!(f, "Consensus Error: {}", msg),
             BlockDBError::TransactionError(msg) => write!(f, "Transaction Error: {}", msg),
         }
@@ -51,8 +51,8 @@ impl From<Box<dyn std::error::Error>> for BlockDBError {
     }
 }
 
-// impl From<crate::auth::AuthError> for BlockDBError {
-//     fn from(error: crate::auth::AuthError) -> Self {
-//         BlockDBError::AuthError(error)
-//     }
-// }
+impl From<crate::auth::AuthError> for BlockDBError {
+    fn from(error: crate::auth::AuthError) -> Self {
+        BlockDBError::AuthError(error)
+    }
+}

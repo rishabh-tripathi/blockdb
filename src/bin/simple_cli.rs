@@ -1,4 +1,4 @@
-use blockdb::{BlockDBConfig, BlockDBHandle};
+use blockdb::{BlockDBConfig, BlockDBHandle, AuthManager, Permission};
 use blockdb::storage::collection::{CollectionManager, IndexDefinition};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
@@ -36,6 +36,10 @@ enum Commands {
     Collection {
         #[command(subcommand)]
         action: CollectionAction,
+    },
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
     },
     Interactive,
 }
@@ -91,6 +95,38 @@ enum CollectionAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AuthAction {
+    CreateUser {
+        username: String,
+        password: String,
+        #[arg(long)]
+        permissions: Vec<String>,
+    },
+    Login {
+        username: String,
+        password: String,
+    },
+    Logout {
+        #[arg(long)]
+        session_id: String,
+    },
+    ListUsers,
+    GrantPermission {
+        username: String,
+        permission: String,
+    },
+    RevokePermission {
+        username: String,
+        permission: String,
+    },
+    ChangePassword {
+        username: String,
+        old_password: String,
+        new_password: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -102,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = BlockDBHandle::new(config.clone())?;
     let collection_manager = CollectionManager::new(config.clone())?;
+    let mut auth_manager = AuthManager::new(config.clone())?;
 
     match args.command {
         Commands::Put { key, value, base64 } => {
@@ -180,9 +217,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Collection { action } => {
             handle_collection_action(action, &collection_manager).await?;
         }
+        Commands::Auth { action } => {
+            handle_auth_action(action, &mut auth_manager).await?;
+        }
         Commands::Interactive => {
             println!("BlockDB Interactive Mode");
-            println!("Commands: put <key> <value>, get <key>, stats, verify, flush, collection <action>, quit");
+            println!("Commands: put <key> <value>, get <key>, stats, verify, flush, collection <action>, auth <action>, quit");
             
             loop {
                 print!("blockdb> ");
@@ -264,12 +304,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("Usage: collection <create|list|drop|put|get|stats|verify|flush> ...");
                         }
                     }
+                    "auth" => {
+                        if parts.len() >= 2 {
+                            handle_interactive_auth_command(&parts[1..], &mut auth_manager).await?;
+                        } else {
+                            println!("Usage: auth <create-user|login|logout|list-users|grant|revoke> ...");
+                        }
+                    }
                     "quit" | "exit" => {
                         println!("Goodbye!");
                         break;
                     }
                     _ => {
-                        println!("Unknown command. Available: put, get, stats, verify, flush, collection, quit");
+                        println!("Unknown command. Available: put, get, stats, verify, flush, collection, auth, quit");
                     }
                 }
             }
@@ -552,6 +599,201 @@ async fn handle_interactive_collection_command(parts: &[&str], collection_manage
         }
         _ => {
             println!("Unknown collection command. Available: create, list, drop, put, get, stats, verify, flush");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_auth_action(action: AuthAction, auth_manager: &mut AuthManager) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        AuthAction::CreateUser { username, password, permissions } => {
+            let perms: Result<Vec<Permission>, _> = permissions.iter()
+                .map(|p| p.parse())
+                .collect();
+            
+            let perms = perms.map_err(|_| "Invalid permission format")?;
+            
+            match auth_manager.create_user(&username, &password, perms) {
+                Ok(user_id) => {
+                    println!("✅ User '{}' created successfully with ID: {}", username, user_id);
+                }
+                Err(e) => {
+                    println!("❌ Failed to create user: {}", e);
+                }
+            }
+        }
+        AuthAction::Login { username, password } => {
+            match auth_manager.authenticate_user(&username, &password) {
+                Ok(context) => {
+                    println!("✅ Login successful!");
+                    println!("   Session ID: {}", context.session_id);
+                    println!("   Expires at: {}", context.expires_at);
+                    println!("   Permissions: {:?}", context.permissions);
+                }
+                Err(e) => {
+                    println!("❌ Login failed: {}", e);
+                }
+            }
+        }
+        AuthAction::Logout { session_id } => {
+            match auth_manager.logout(&session_id) {
+                Ok(_) => {
+                    println!("✅ Logout successful");
+                }
+                Err(e) => {
+                    println!("❌ Logout failed: {}", e);
+                }
+            }
+        }
+        AuthAction::ListUsers => {
+            let users = auth_manager.list_users()?;
+            if users.is_empty() {
+                println!("No users found.");
+            } else {
+                println!("Users:");
+                for user in users {
+                    println!("  • {} ({})", user.username, user.user_id);
+                    println!("    Status: {:?}", user.status);
+                    println!("    Permissions: {:?}", user.permissions);
+                    println!("    Created: {}", user.created_at);
+                    println!();
+                }
+            }
+        }
+        AuthAction::GrantPermission { username, permission } => {
+            let perm: Permission = permission.parse()
+                .map_err(|_| "Invalid permission format")?;
+            
+            match auth_manager.grant_permission(&username, perm) {
+                Ok(_) => {
+                    println!("✅ Permission '{}' granted to user '{}'", permission, username);
+                }
+                Err(e) => {
+                    println!("❌ Failed to grant permission: {}", e);
+                }
+            }
+        }
+        AuthAction::RevokePermission { username, permission } => {
+            let perm: Permission = permission.parse()
+                .map_err(|_| "Invalid permission format")?;
+            
+            match auth_manager.revoke_permission(&username, perm) {
+                Ok(_) => {
+                    println!("✅ Permission '{}' revoked from user '{}'", permission, username);
+                }
+                Err(e) => {
+                    println!("❌ Failed to revoke permission: {}", e);
+                }
+            }
+        }
+        AuthAction::ChangePassword { username, old_password, new_password } => {
+            match auth_manager.change_password(&username, &old_password, &new_password) {
+                Ok(_) => {
+                    println!("✅ Password changed successfully for user '{}'", username);
+                }
+                Err(e) => {
+                    println!("❌ Failed to change password: {}", e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_interactive_auth_command(parts: &[&str], auth_manager: &mut AuthManager) -> Result<(), Box<dyn std::error::Error>> {
+    match parts[0] {
+        "create-user" => {
+            if parts.len() >= 3 {
+                let username = parts[1];
+                let password = parts[2];
+                let permissions = if parts.len() > 3 {
+                    parts[3..].iter().map(|s| s.parse()).collect::<Result<Vec<Permission>, _>>()
+                        .map_err(|_| "Invalid permission format")?
+                } else {
+                    vec![Permission::Read] // Default permission
+                };
+                
+                match auth_manager.create_user(username, password, permissions) {
+                    Ok(user_id) => println!("✅ User '{}' created with ID: {}", username, user_id),
+                    Err(e) => println!("❌ Error: {}", e),
+                }
+            } else {
+                println!("Usage: auth create-user <username> <password> [permissions...]");
+            }
+        }
+        "login" => {
+            if parts.len() >= 3 {
+                let username = parts[1];
+                let password = parts[2];
+                
+                match auth_manager.authenticate_user(username, password) {
+                    Ok(context) => {
+                        println!("✅ Login successful!");
+                        println!("   Session: {}", context.session_id);
+                        println!("   Expires: {}", context.expires_at);
+                    }
+                    Err(e) => println!("❌ Error: {}", e),
+                }
+            } else {
+                println!("Usage: auth login <username> <password>");
+            }
+        }
+        "logout" => {
+            if parts.len() >= 2 {
+                let session_id = parts[1];
+                match auth_manager.logout(session_id) {
+                    Ok(_) => println!("✅ Logout successful"),
+                    Err(e) => println!("❌ Error: {}", e),
+                }
+            } else {
+                println!("Usage: auth logout <session_id>");
+            }
+        }
+        "list-users" => {
+            match auth_manager.list_users() {
+                Ok(users) => {
+                    if users.is_empty() {
+                        println!("No users found.");
+                    } else {
+                        println!("Users:");
+                        for user in users {
+                            println!("  • {} ({})", user.username, user.user_id);
+                        }
+                    }
+                }
+                Err(e) => println!("❌ Error: {}", e),
+            }
+        }
+        "grant" => {
+            if parts.len() >= 3 {
+                let username = parts[1];
+                let permission: Permission = parts[2].parse()
+                    .map_err(|_| "Invalid permission format")?;
+                
+                match auth_manager.grant_permission(username, permission) {
+                    Ok(_) => println!("✅ Permission granted"),
+                    Err(e) => println!("❌ Error: {}", e),
+                }
+            } else {
+                println!("Usage: auth grant <username> <permission>");
+            }
+        }
+        "revoke" => {
+            if parts.len() >= 3 {
+                let username = parts[1];
+                let permission: Permission = parts[2].parse()
+                    .map_err(|_| "Invalid permission format")?;
+                
+                match auth_manager.revoke_permission(username, permission) {
+                    Ok(_) => println!("✅ Permission revoked"),
+                    Err(e) => println!("❌ Error: {}", e),
+                }
+            } else {
+                println!("Usage: auth revoke <username> <permission>");
+            }
+        }
+        _ => {
+            println!("Unknown auth command. Available: create-user, login, logout, list-users, grant, revoke");
         }
     }
     Ok(())

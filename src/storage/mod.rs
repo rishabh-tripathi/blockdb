@@ -30,6 +30,11 @@ pub struct BlockDBConfig {
     pub wal_sync_interval_ms: u64,
     pub compaction_threshold: usize,
     pub blockchain_batch_size: usize,
+    pub auth_enabled: bool,
+    pub session_duration_hours: u64,
+    pub password_min_length: usize,
+    pub max_failed_attempts: u32,
+    pub account_lockout_duration_minutes: u64,
 }
 
 impl Default for BlockDBConfig {
@@ -40,6 +45,11 @@ impl Default for BlockDBConfig {
             wal_sync_interval_ms: 1000, // 1 second
             compaction_threshold: 4,
             blockchain_batch_size: 1000,
+            auth_enabled: true,
+            session_duration_hours: 24,
+            password_min_length: 8,
+            max_failed_attempts: 5,
+            account_lockout_duration_minutes: 30,
         }
     }
 }

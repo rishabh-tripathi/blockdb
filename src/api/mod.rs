@@ -2,7 +2,7 @@ use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
-use crate::{BlockDBHandle, BlockDBError};
+use crate::{BlockDBHandle, BlockDBError, AuthManager, AuthContext, Permission};
 
 // pub mod http;
 // pub mod websocket;
@@ -15,6 +15,9 @@ pub struct ApiConfig {
     pub request_timeout: u64,
     pub enable_cors: bool,
     pub enable_compression: bool,
+    pub auth_enabled: bool,
+    pub require_auth_for_reads: bool,
+    pub session_duration_hours: u64,
 }
 
 impl Default for ApiConfig {
@@ -26,6 +29,9 @@ impl Default for ApiConfig {
             request_timeout: 30,
             enable_cors: true,
             enable_compression: true,
+            auth_enabled: true,
+            require_auth_for_reads: false,
+            session_duration_hours: 24,
         }
     }
 }
@@ -35,12 +41,14 @@ pub struct WriteRequest {
     pub key: String,
     pub value: String,
     pub encoding: Option<String>,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadRequest {
     pub key: String,
     pub encoding: Option<String>,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,10 +98,49 @@ pub struct StatsResponse {
     pub storage_size: u64,
 }
 
+// Authentication Request/Response Types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginResponse {
+    pub success: bool,
+    pub auth_token: Option<String>,
+    pub message: String,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+    pub permissions: Vec<String>,
+    pub auth_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUserResponse {
+    pub success: bool,
+    pub message: String,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub user_id: String,
+    pub permissions: Vec<String>,
+    pub grant: bool, // true to grant, false to revoke
+    pub auth_token: String,
+}
+
 pub struct BlockDBServer {
     db: BlockDBHandle,
     config: ApiConfig,
     stats: Arc<RwLock<Stats>>,
+    auth_manager: Option<Arc<RwLock<AuthManager>>>,
 }
 
 #[derive(Debug, Default)]
@@ -114,6 +161,19 @@ impl BlockDBServer {
             db,
             config,
             stats: Arc::new(RwLock::new(stats)),
+            auth_manager: None,
+        }
+    }
+
+    pub fn with_auth(db: BlockDBHandle, config: ApiConfig, auth_manager: AuthManager) -> Self {
+        let mut stats = Stats::default();
+        stats.start_time = Some(std::time::SystemTime::now());
+        
+        BlockDBServer {
+            db,
+            config,
+            stats: Arc::new(RwLock::new(stats)),
+            auth_manager: Some(Arc::new(RwLock::new(auth_manager))),
         }
     }
 
@@ -144,12 +204,104 @@ impl BlockDBServer {
     async fn create_routes(&self) -> Router {
         let db = self.db.clone();
         let stats = self.stats.clone();
+        let auth_manager = self.auth_manager.clone();
         
         Router::new()
-            .with_state(AppState { db, stats })
+            .with_state(AppState { db, stats, auth_manager })
+    }
+
+    // Authentication methods
+    async fn authenticate_request(&self, token: Option<String>, required_permission: Permission) -> Result<AuthContext, BlockDBError> {
+        if !self.config.auth_enabled {
+            // If auth is disabled, return a dummy context with all permissions
+            return Ok(AuthContext::new(
+                "anonymous".to_string(),
+                vec![Permission::Admin], // Grant all permissions when auth is disabled
+                self.config.session_duration_hours * 3600,
+            ));
+        }
+
+        let auth_manager = self.auth_manager.as_ref()
+            .ok_or_else(|| BlockDBError::AuthError(crate::auth::AuthError::InvalidCredentials))?;
+
+        let token = token.ok_or_else(|| BlockDBError::AuthError(crate::auth::AuthError::InvalidCredentials))?;
+        
+        let auth_manager = auth_manager.read().await;
+        let context = auth_manager.validate_session(&token)?;
+        
+        if !context.has_permission(&required_permission) {
+            return Err(BlockDBError::AuthError(crate::auth::AuthError::InsufficientPermissions {
+                required: required_permission,
+                user: context.user_id.clone(),
+            }));
+        }
+
+        Ok(context)
+    }
+
+    pub async fn login(&self, request: LoginRequest) -> Result<LoginResponse, BlockDBError> {
+        let auth_manager = self.auth_manager.as_ref()
+            .ok_or_else(|| BlockDBError::AuthError(crate::auth::AuthError::InvalidCredentials))?;
+
+        let auth_manager = auth_manager.read().await;
+        
+        match auth_manager.authenticate_user(&request.username, &request.password) {
+            Ok(context) => {
+                Ok(LoginResponse {
+                    success: true,
+                    auth_token: Some(context.session_id.clone()),
+                    message: "Login successful".to_string(),
+                    expires_at: Some(context.expires_at),
+                })
+            }
+            Err(e) => {
+                Ok(LoginResponse {
+                    success: false,
+                    auth_token: None,
+                    message: format!("Login failed: {}", e),
+                    expires_at: None,
+                })
+            }
+        }
+    }
+
+    pub async fn create_user(&self, request: CreateUserRequest) -> Result<CreateUserResponse, BlockDBError> {
+        let _context = self.authenticate_request(Some(request.auth_token), Permission::CreateUser).await?;
+        
+        let auth_manager = self.auth_manager.as_ref()
+            .ok_or_else(|| BlockDBError::AuthError(crate::auth::AuthError::InvalidCredentials))?;
+
+        let permissions: Result<Vec<Permission>, _> = request.permissions.iter()
+            .map(|p| p.parse())
+            .collect();
+        
+        let permissions = permissions.map_err(|_| BlockDBError::InvalidData("Invalid permission format".to_string()))?;
+
+        let mut auth_manager = auth_manager.write().await;
+        
+        match auth_manager.create_user(&request.username, &request.password, permissions) {
+            Ok(user_id) => {
+                Ok(CreateUserResponse {
+                    success: true,
+                    message: "User created successfully".to_string(),
+                    user_id: Some(user_id),
+                })
+            }
+            Err(e) => {
+                Ok(CreateUserResponse {
+                    success: false,
+                    message: format!("Failed to create user: {}", e),
+                    user_id: None,
+                })
+            }
+        }
     }
 
     pub async fn write(&self, request: WriteRequest) -> Result<WriteResponse, BlockDBError> {
+        // Authenticate if auth is enabled
+        if self.config.auth_enabled {
+            self.authenticate_request(request.auth_token, Permission::Write).await?;
+        }
         let key = if request.encoding.as_deref() == Some("base64") {
             base64::engine::general_purpose::STANDARD.decode(&request.key).map_err(|e| BlockDBError::InvalidData(format!("Invalid base64 key: {}", e)))?
         } else {
@@ -181,6 +333,10 @@ impl BlockDBServer {
     }
 
     pub async fn read(&self, request: ReadRequest) -> Result<ReadResponse, BlockDBError> {
+        // Authenticate if auth is enabled and required for reads
+        if self.config.auth_enabled && self.config.require_auth_for_reads {
+            self.authenticate_request(request.auth_token, Permission::Read).await?;
+        }
         let key = if request.encoding.as_deref() == Some("base64") {
             base64::engine::general_purpose::STANDARD.decode(&request.key).map_err(|e| BlockDBError::InvalidData(format!("Invalid base64 key: {}", e)))?
         } else {
@@ -291,6 +447,7 @@ impl BlockDBServer {
 struct AppState {
     db: BlockDBHandle,
     stats: Arc<RwLock<Stats>>,
+    auth_manager: Option<Arc<RwLock<AuthManager>>>,
 }
 
 struct Router {

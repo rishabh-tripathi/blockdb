@@ -37,12 +37,17 @@ pub enum Permission {
 
 impl Permission {
     pub fn implies(&self, other: &Permission) -> bool {
+        // A permission always implies itself; the specialized arms add the extra
+        // permissions each one subsumes.
+        if self == other {
+            return true;
+        }
         match self {
             Permission::Admin => true, // Admin implies all permissions
             Permission::Write => matches!(other, Permission::Read), // Write implies Read
             Permission::ModifyUser => matches!(other, Permission::CreateUser), // Modify implies Create
             Permission::GrantPermission => matches!(other, Permission::RevokePermission), // Grant implies Revoke
-            _ => self == other,
+            _ => false,
         }
     }
 
@@ -57,6 +62,40 @@ impl Permission {
                 | Permission::ModifyClusterConfig
                 | Permission::Admin
         )
+    }
+}
+
+impl std::str::FromStr for Permission {
+    type Err = AuthError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let perm = match s.to_lowercase().as_str() {
+            "read" => Permission::Read,
+            "write" => Permission::Write,
+            "delete" => Permission::Delete,
+            "begintransaction" | "begin_transaction" => Permission::BeginTransaction,
+            "committransaction" | "commit_transaction" => Permission::CommitTransaction,
+            "rollbacktransaction" | "rollback_transaction" => Permission::RollbackTransaction,
+            "createuser" | "create_user" => Permission::CreateUser,
+            "modifyuser" | "modify_user" => Permission::ModifyUser,
+            "deleteuser" | "delete_user" => Permission::DeleteUser,
+            "grantpermission" | "grant_permission" => Permission::GrantPermission,
+            "revokepermission" | "revoke_permission" => Permission::RevokePermission,
+            "viewstats" | "view_stats" => Permission::ViewStats,
+            "viewhealth" | "view_health" => Permission::ViewHealth,
+            "viewclusterstatus" | "view_cluster_status" => Permission::ViewClusterStatus,
+            "modifyclusterconfig" | "modify_cluster_config" => Permission::ModifyClusterConfig,
+            "viewblockchain" | "view_blockchain" => Permission::ViewBlockchain,
+            "verifyintegrity" | "verify_integrity" => Permission::VerifyIntegrity,
+            "admin" => Permission::Admin,
+            other => {
+                return Err(AuthError::CryptographicError(format!(
+                    "Unknown permission: {}",
+                    other
+                )))
+            }
+        };
+        Ok(perm)
     }
 }
 

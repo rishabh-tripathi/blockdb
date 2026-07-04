@@ -135,16 +135,16 @@ impl ReplicatedLog {
         }
     }
     
-    pub fn apply_up_to(&mut self, index: u64) -> Vec<&LogEntry> {
+    pub fn apply_up_to(&mut self, index: u64) -> Vec<LogEntry> {
         let mut applied = Vec::new();
-        
+
         while self.last_applied < index && self.last_applied < self.commit_index {
             self.last_applied += 1;
             if let Some(entry) = self.get_entry(self.last_applied) {
-                applied.push(entry);
+                applied.push(entry.clone());
             }
         }
-        
+
         applied
     }
     

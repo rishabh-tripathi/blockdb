@@ -7,6 +7,16 @@ use uuid::Uuid;
 
 pub mod raft;
 pub mod log_entry;
+pub mod transport;
+
+/// A replicated state machine that applies committed Raft log entries.
+///
+/// The Raft layer guarantees each committed entry is applied exactly once, in log
+/// order, on every node — giving all nodes an identical, consistent view of the data.
+#[async_trait::async_trait]
+pub trait StateMachine: Send + Sync {
+    async fn apply(&self, entry: &log_entry::LogEntry) -> Result<(), crate::error::BlockDBError>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
@@ -135,12 +145,14 @@ pub enum ConsensusMessage {
     },
 }
 
+#[async_trait::async_trait]
 pub trait ConsensusEngine: Send + Sync {
     async fn propose(&self, operation: crate::transaction::Operation) -> Result<(), crate::error::BlockDBError>;
     async fn is_leader(&self) -> bool;
     async fn get_leader(&self) -> Option<NodeId>;
     async fn add_node(&self, node_id: NodeId, address: NodeAddress) -> Result<(), crate::error::BlockDBError>;
     async fn remove_node(&self, node_id: &NodeId) -> Result<(), crate::error::BlockDBError>;
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[derive(Debug)]

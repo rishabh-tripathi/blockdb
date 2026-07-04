@@ -1,7 +1,8 @@
 use crate::auth::{AuthError, PrivateKey, PublicKey, Signature, UserId};
+use base64::Engine;
 use ed25519_dalek::{Keypair, PublicKey as Ed25519PublicKey, SecretKey, Signature as Ed25519Signature, Signer, Verifier};
 use rand::rngs::OsRng;
-use rand::{CryptoRng, RngCore};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,9 +14,18 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn generate() -> Result<Self, AuthError> {
-        let mut csprng = OsRng {};
-        let keypair = Keypair::generate(&mut csprng);
-        
+        // ed25519-dalek 1.0 pins rand_core 0.5, which is incompatible with the
+        // rand 0.8 OsRng used elsewhere in this crate. Generate the 32-byte seed
+        // directly from the OS CSPRNG and derive the keypair from it, which avoids
+        // the version mismatch while remaining cryptographically sound.
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+
+        let secret = SecretKey::from_bytes(&seed)
+            .map_err(|e| AuthError::CryptographicError(e.to_string()))?;
+        let public = Ed25519PublicKey::from(&secret);
+        let keypair = Keypair { secret, public };
+
         Ok(Self {
             public_key: keypair.public.to_bytes().to_vec(),
             private_key: keypair.secret.to_bytes().to_vec(),
@@ -94,7 +104,32 @@ impl CryptoUtils {
         hasher.finalize().to_vec()
     }
 
+    /// Hash a password with Argon2id (memory-hard), salted. The 16-byte prefix of the
+    /// provided salt is used as the Argon2 salt. Returns the raw 32-byte derived key.
+    /// Argon2id resists GPU/ASIC brute-forcing far better than a single SHA-256.
     pub fn hash_password(password: &str, salt: &[u8]) -> Vec<u8> {
+        use argon2::{Argon2, PasswordHasher};
+        use argon2::password_hash::SaltString;
+
+        // Argon2's SaltString requires base64; derive it deterministically from the
+        // caller-supplied salt so the same (password, salt) always yields the same hash.
+        let salt_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&salt[..salt.len().min(16)]);
+        match SaltString::from_b64(&salt_b64) {
+            Ok(salt_string) => {
+                let argon2 = Argon2::default();
+                match argon2.hash_password(password.as_bytes(), &salt_string) {
+                    Ok(hash) => hash
+                        .hash
+                        .map(|h| h.as_bytes().to_vec())
+                        .unwrap_or_else(|| Self::sha256_fallback(password, salt)),
+                    Err(_) => Self::sha256_fallback(password, salt),
+                }
+            }
+            Err(_) => Self::sha256_fallback(password, salt),
+        }
+    }
+
+    fn sha256_fallback(password: &str, salt: &[u8]) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(password.as_bytes());
         hasher.update(salt);

@@ -47,7 +47,13 @@ impl From<bincode::Error> for BlockDBError {
 
 impl From<Box<dyn std::error::Error>> for BlockDBError {
     fn from(error: Box<dyn std::error::Error>) -> Self {
-        BlockDBError::StorageError(error.to_string())
+        // Preserve the original typed error when the boxed error is already a
+        // BlockDBError (e.g. DuplicateKey), so callers/HTTP layers can map it to the
+        // correct status code instead of collapsing everything into StorageError.
+        match error.downcast::<BlockDBError>() {
+            Ok(boxed) => *boxed,
+            Err(other) => BlockDBError::StorageError(other.to_string()),
+        }
     }
 }
 

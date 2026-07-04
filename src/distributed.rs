@@ -51,8 +51,10 @@ impl DistributedBlockDB {
         let storage = BlockDB::new(config.storage_config.clone())?;
         let storage = Arc::new(RwLock::new(storage));
         
-        // Initialize consensus engine (Raft)
-        let raft_node = RaftNode::new(config.cluster_config.clone());
+        // Initialize consensus engine (Raft). This legacy wrapper uses a local
+        // (no-op) transport/state machine; the real multi-node path lives in
+        // `crate::cluster::ClusterNode`.
+        let raft_node = RaftNode::new_local(config.cluster_config.clone());
         let consensus: Arc<dyn ConsensusEngine + Send + Sync> = Arc::new(raft_node);
         
         // Initialize transaction manager if enabled
@@ -104,25 +106,24 @@ impl DistributedBlockDB {
     
     // ACID-compliant operations
     
-    /// Single put operation (goes through consensus)
+    /// Single put operation.
+    ///
+    /// NOTE: This is the legacy single-node wrapper. For a consistent, replicated
+    /// multi-node deployment use `crate::cluster::ClusterNode`, which drives writes
+    /// through Raft and applies committed entries to every node's storage.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), BlockDBError> {
-        let operation = Operation::Put {
-            key: key.to_vec(),
-            value: value.to_vec(),
-        };
-        
-        // Use consensus to ensure all nodes agree
-        self.consensus.propose(operation).await?;
-        
-        // If we're the leader, the operation will be applied to storage through log application
-        // If we're a follower, we wait for the leader to replicate the change
-        
+        // Apply directly to the local durable store.
+        {
+            let storage = self.storage.write();
+            storage.put(key, value).map_err(BlockDBError::from)?;
+        }
+
         // Update read cache for better performance
         self.read_cache.insert(
             key.to_vec(),
             (value.to_vec(), self.current_timestamp()),
         );
-        
+
         Ok(())
     }
     
@@ -314,7 +315,7 @@ impl DistributedBlockDB {
     
     pub async fn verify_integrity(&self) -> Result<bool, BlockDBError> {
         let storage = self.storage.read();
-        storage.verify_integrity()
+        storage.verify_integrity().map_err(BlockDBError::from)
     }
     
     pub async fn force_sync(&self) -> Result<(), BlockDBError> {
@@ -376,7 +377,7 @@ impl DistributedBlockDB {
                     .as_millis() as u64;
                 
                 // Remove entries older than 5 seconds
-                read_cache.retain(|_, (_, timestamp)| current_time - timestamp < 5000);
+                read_cache.retain(|_, (_, timestamp)| current_time.saturating_sub(*timestamp) < 5000);
             }
         });
         
@@ -429,21 +430,6 @@ impl TransactionContext {
         db.execute_in_transaction(&self.tx_id, operation).await
     }
 }
-
-// Extension trait to add any() method to ConsensusEngine
-trait AnyTrait: std::any::Any {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-impl<T: std::any::Any> AnyTrait for T {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-// Extend ConsensusEngine with Any
-pub trait ConsensusEngineExt: ConsensusEngine + AnyTrait {}
-impl<T: ConsensusEngine + AnyTrait> ConsensusEngineExt for T {}
 
 #[cfg(test)]
 mod tests {

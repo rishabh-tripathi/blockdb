@@ -53,17 +53,27 @@ cargo build --release
 - **Collection Metadata**: Rich statistics and configuration per collection
 - **Tenant-Safe**: Perfect for multi-tenant applications
 
+### Consent Management (blockchain-backed)
+- **Event-Sourced Consent**: Every grant/withdrawal is an immutable, time-ordered event
+- **Tamper-Evident**: Each event carries a SHA-256 proof hash and is anchored in the blockchain
+- **Point-in-Time & Current State**: Query the latest status or the full audit history
+- **GDPR-Friendly**: Purpose-scoped consent per data subject with rich metadata
+
 ### Distributed System Features
-- **Raft Consensus**: Leader election and log replication
-- **ACID Transactions**: Full transaction support with 2PC
+- **Raft Consensus (multi-node)**: Real HTTP transport, leader election, log
+  replication, and majority commit — writes are linearized through the leader and
+  applied to every node's storage in the same order
+- **Strong Consistency**: All nodes converge on an identical view; follower writes
+  are transparently forwarded to the leader
+- **ACID Transactions**: Transaction manager with 2PC coordinator
 - **Fine-Grained Locking**: Deadlock detection and prevention
-- **Cluster Management**: Dynamic node discovery and health monitoring
-- **Fault Tolerance**: Handles node failures and network partitions
 
 ### Enterprise Features
-- **Strong Consistency**: CP guarantee from CAP theorem
+- **Strong Consistency**: Serialized append-only writes on a single node
 - **Blockchain Audit Trail**: Immutable history with integrity verification
-- **Multi-Node Deployment**: Horizontal scaling capabilities
+- **Durable by Default**: WAL with per-write `fsync`, CRC-checked crash recovery, SSTable
+  reload on startup, and size-tiered compaction
+- **Observability**: Structured `tracing` logs, `/health`, `/stats`, and Prometheus `/metrics`
 - **Configurable Persistence**: Customizable storage and performance settings
 
 ## 🏗️ Architecture
@@ -97,6 +107,88 @@ BlockDB implements a layered architecture designed for scalability and reliabili
 │                 Write-Ahead Log (WAL)                      │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Consent Management API
+
+BlockDB ships a consent store built for privacy/GDPR use cases. Because the engine is
+append-only, consent is modeled as an immutable **event log**: each grant or withdrawal
+is a new, time-ordered, hash-proofed record, and the current state is derived from the
+latest event. Nothing is ever mutated in place, so the audit trail is tamper-evident by
+construction and anchored in the blockchain.
+
+**HTTP endpoints**
+
+```bash
+# Grant consent (metadata is optional, arbitrary key/values)
+curl -X POST http://localhost:8080/consent/grant \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_id":"alice","purpose":"marketing","metadata":{"policy":"v2"}}'
+
+# Withdraw consent
+curl -X POST http://localhost:8080/consent/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_id":"alice","purpose":"marketing"}'
+
+# Current status for a (subject, purpose)
+curl 'http://localhost:8080/consent/status?subject=alice&purpose=marketing'
+
+# Full immutable audit history
+curl 'http://localhost:8080/consent/history?subject=alice&purpose=marketing'
+
+# All purposes for a subject
+curl 'http://localhost:8080/consent/subject?subject=alice'
+```
+
+**Rust API** — see `examples/consent_demo.rs` (`cargo run --example consent_demo`):
+
+```rust
+use blockdb::{BlockDBConfig, BlockDBHandle, ConsentStore};
+use std::collections::BTreeMap;
+
+let db = BlockDBHandle::new(BlockDBConfig::default())?;
+let consent = ConsentStore::new(db);
+consent.grant("alice", "marketing", BTreeMap::new()).await?;
+assert!(consent.is_granted("alice", "marketing").await?);
+consent.withdraw("alice", "marketing", BTreeMap::new()).await?;
+let history = consent.history("alice", "marketing").await?; // both events retained
+```
+
+### Multi-Node Cluster
+
+BlockDB is an immutable, append-only key/value store that replicates via Raft. Run
+one `blockdb-node` process per member; each owns a durable local store and talks to
+its peers over HTTP. Writes are linearized through the elected leader, replicated to
+a majority, then applied to every node — so all nodes stay strongly consistent. A
+write sent to a follower is forwarded to the leader automatically.
+
+```bash
+# Node 0 (repeat per node with its own --node-id / --port / --data-dir)
+blockdb-node --node-id node0 --host 0.0.0.0 --port 8080 \
+  --peers node0@10.0.0.1:8080,node1@10.0.0.2:8080,node2@10.0.0.3:8080 \
+  --data-dir /var/lib/blockdb
+
+# Write to any node (followers forward to the leader)
+curl -X POST http://10.0.0.2:8080/kv -d '{"key":"user:1","value":"alice"}'
+
+# Read from any node (local, eventually-consistent reads)
+curl 'http://10.0.0.3:8080/kv?key=user:1'
+
+# Cluster/leadership status
+curl http://10.0.0.1:8080/status
+```
+
+A 3-node cluster tolerates 1 node failure (majority = 2); a 5-node cluster tolerates
+2. Use an odd number of nodes. Reads are served locally for low latency; route reads
+to the leader if you require linearizable reads.
+
+### Operational Endpoints
+
+- `GET /health` — liveness + blockchain integrity (503 if integrity fails)
+- `GET /stats` — JSON counters (writes, reads, consent events, auth failures)
+- `GET /metrics` — Prometheus text exposition
+- `POST /login` — obtain a bearer session token
+- `POST /users` — create a user (requires `CreateUser`/`Admin`)
+- `POST /kv` / `GET /kv?key=…` — key/value write/read (base64 encoding supported)
 
 ### Key Components
 

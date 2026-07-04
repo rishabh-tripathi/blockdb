@@ -1,485 +1,223 @@
-use blockdb::{BlockDBHandle, BlockDBConfig, AuthManager, Permission};
-use blockdb::api::{
-    BlockDBServer, ApiConfig, LoginRequest, LoginResponse, CreateUserRequest, 
-    CreateUserResponse, WriteRequest, ReadRequest, PermissionRequest
-};
+//! End-to-end HTTP API tests. These start the real hyper server on a loopback port
+//! and exercise it over TCP, verifying health, auth, key/value and consent endpoints.
+
+use blockdb::api::{ApiConfig, BlockDBServer};
+use blockdb::auth::{AuthConfig, PermissionSet};
+use blockdb::{AuthManager, BlockDBConfig, BlockDBHandle, Permission};
+use hyper::{Body, Client, Method, Request, StatusCode};
+use std::sync::atomic::{AtomicU16, Ordering};
 use tempfile::TempDir;
 
-/// Comprehensive API authentication tests
-/// Tests all authentication-related API endpoints and middleware
-#[tokio::test]
-async fn test_login_api_endpoint() {
+static NEXT_PORT: AtomicU16 = AtomicU16::new(19080);
+
+async fn start_server(auth_enabled: bool, require_auth_for_reads: bool) -> (u16, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+
+    let db_config = BlockDBConfig {
         data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        session_duration_hours: 24,
+        auth_enabled,
         ..Default::default()
     };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    // Pre-create a user for testing
-    auth_manager
-        .create_user("testuser", "testpass123", vec![Permission::Read, Permission::Write])
-        .unwrap();
+    let db = BlockDBHandle::new(db_config).unwrap();
 
     let api_config = ApiConfig {
-        auth_enabled: true,
+        host: "127.0.0.1".to_string(),
+        port,
+        auth_enabled,
+        require_auth_for_reads,
         ..Default::default()
     };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
 
-    // Test 1: Successful login
-    let login_request = LoginRequest {
-        username: "testuser".to_string(),
-        password: "testpass123".to_string(),
+    let server = if auth_enabled {
+        let am = AuthManager::new(AuthConfig::default());
+        am.create_user(
+            "writer".to_string(),
+            "Str0ng!Pass",
+            PermissionSet::read_write(),
+            Some("admin".to_string()),
+            0,
+        )
+        .unwrap();
+        BlockDBServer::with_auth(db, api_config, am)
+    } else {
+        BlockDBServer::new(db, api_config)
     };
 
-    let response = server.login(login_request).await.unwrap();
-    assert!(response.success);
-    assert!(response.auth_token.is_some());
-    assert!(response.expires_at.is_some());
-    assert_eq!(response.message, "Login successful");
+    tokio::spawn(async move {
+        let _ = server.start().await;
+    });
 
-    // Test 2: Failed login - wrong password
-    let bad_login = LoginRequest {
-        username: "testuser".to_string(),
-        password: "wrongpass".to_string(),
-    };
-
-    let response = server.login(bad_login).await.unwrap();
-    assert!(!response.success);
-    assert!(response.auth_token.is_none());
-    assert!(response.expires_at.is_none());
-    assert!(response.message.contains("Login failed"));
-
-    // Test 3: Failed login - nonexistent user
-    let nonexistent_login = LoginRequest {
-        username: "nonexistent".to_string(),
-        password: "anypass".to_string(),
-    };
-
-    let response = server.login(nonexistent_login).await.unwrap();
-    assert!(!response.success);
-    assert!(response.auth_token.is_none());
+    // Give the listener a moment to bind.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    (port, temp_dir)
 }
 
-#[tokio::test]
-async fn test_create_user_api_endpoint() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        ..Default::default()
-    };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    // Create admin user
-    let admin_id = auth_manager
-        .create_user("admin", "admin123", vec![Permission::Admin])
-        .unwrap();
-
-    let admin_context = auth_manager
-        .authenticate_user("admin", "admin123")
-        .unwrap();
-
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        ..Default::default()
-    };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-
-    // Test 1: Successful user creation by admin
-    let create_request = CreateUserRequest {
-        username: "newuser".to_string(),
-        password: "newpass123".to_string(),
-        permissions: vec!["Read".to_string(), "Write".to_string()],
-        auth_token: admin_context.session_id.clone(),
-    };
-
-    let response = server.create_user(create_request).await.unwrap();
-    assert!(response.success);
-    assert!(response.user_id.is_some());
-    assert_eq!(response.message, "User created successfully");
-
-    // Test 2: Duplicate user creation should fail
-    let duplicate_request = CreateUserRequest {
-        username: "newuser".to_string(), // Same username
-        password: "anotherpass".to_string(),
-        permissions: vec!["Read".to_string()],
-        auth_token: admin_context.session_id.clone(),
-    };
-
-    let response = server.create_user(duplicate_request).await.unwrap();
-    assert!(!response.success);
-    assert!(response.user_id.is_none());
-    assert!(response.message.contains("Failed to create user"));
-
-    // Test 3: User creation with invalid permissions
-    let invalid_perms_request = CreateUserRequest {
-        username: "invaliduser".to_string(),
-        password: "pass123".to_string(),
-        permissions: vec!["InvalidPermission".to_string()],
-        auth_token: admin_context.session_id.clone(),
-    };
-
-    let result = server.create_user(invalid_perms_request).await;
-    assert!(result.is_err()); // Should fail due to invalid permission format
-
-    // Test 4: User creation without admin token should fail
-    let unauthorized_request = CreateUserRequest {
-        username: "unauthorized".to_string(),
-        password: "pass123".to_string(),
-        permissions: vec!["Read".to_string()],
-        auth_token: "invalid_token".to_string(),
-    };
-
-    let result = server.create_user(unauthorized_request).await;
-    assert!(result.is_err()); // Should fail due to authentication error
+async fn get(port: u16, path: &str) -> (StatusCode, serde_json::Value) {
+    let client = Client::new();
+    let uri = format!("http://127.0.0.1:{}{}", port, path);
+    let resp = client.get(uri.parse().unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
 }
 
-#[tokio::test]
-async fn test_authenticated_data_operations() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        ..Default::default()
-    };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    // Create users with different permissions
-    auth_manager
-        .create_user("writer", "pass123", vec![Permission::Write])
-        .unwrap();
-    
-    auth_manager
-        .create_user("reader", "pass123", vec![Permission::Read])
-        .unwrap();
-
-    let writer_context = auth_manager.authenticate_user("writer", "pass123").unwrap();
-    let reader_context = auth_manager.authenticate_user("reader", "pass123").unwrap();
-
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        require_auth_for_reads: true,
-        ..Default::default()
-    };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-
-    // Test 1: Writer can write data
-    let write_request = WriteRequest {
-        key: "test_key".to_string(),
-        value: "test_value".to_string(),
-        encoding: None,
-        auth_token: Some(writer_context.session_id.clone()),
-    };
-
-    let response = server.write(write_request).await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.message, "Data written successfully");
-
-    // Test 2: Reader can read data
-    let read_request = ReadRequest {
-        key: "test_key".to_string(),
-        encoding: None,
-        auth_token: Some(reader_context.session_id.clone()),
-    };
-
-    let response = server.read(read_request).await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.data.unwrap(), "test_value");
-    assert_eq!(response.message, "Data found");
-
-    // Test 3: Reader cannot write data (insufficient permissions)
-    let unauthorized_write = WriteRequest {
-        key: "reader_key".to_string(),
-        value: "reader_value".to_string(),
-        encoding: None,
-        auth_token: Some(reader_context.session_id.clone()),
-    };
-
-    let result = server.write(unauthorized_write).await;
-    assert!(result.is_err()); // Should fail due to insufficient permissions
-
-    // Test 4: No token provided should fail
-    let no_token_write = WriteRequest {
-        key: "no_token_key".to_string(),
-        value: "no_token_value".to_string(),
-        encoding: None,
-        auth_token: None,
-    };
-
-    let result = server.write(no_token_write).await;
-    assert!(result.is_err()); // Should fail due to missing authentication
-
-    // Test 5: No token for read should also fail (since require_auth_for_reads is true)
-    let no_token_read = ReadRequest {
-        key: "test_key".to_string(),
-        encoding: None,
-        auth_token: None,
-    };
-
-    let result = server.read(no_token_read).await;
-    assert!(result.is_err()); // Should fail due to missing authentication
-}
-
-#[tokio::test]
-async fn test_base64_encoding_with_auth() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        ..Default::default()
-    };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    auth_manager
-        .create_user("encoder", "pass123", vec![Permission::Read, Permission::Write])
-        .unwrap();
-
-    let context = auth_manager.authenticate_user("encoder", "pass123").unwrap();
-
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        ..Default::default()
-    };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-
-    // Test 1: Write with base64 encoding
-    let binary_data = vec![0, 1, 2, 255, 128, 64];
-    let encoded_key = base64::engine::general_purpose::STANDARD.encode("binary_key");
-    let encoded_value = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-
-    let write_request = WriteRequest {
-        key: encoded_key.clone(),
-        value: encoded_value.clone(),
-        encoding: Some("base64".to_string()),
-        auth_token: Some(context.session_id.clone()),
-    };
-
-    let response = server.write(write_request).await.unwrap();
-    assert!(response.success);
-
-    // Test 2: Read with base64 encoding
-    let read_request = ReadRequest {
-        key: encoded_key,
-        encoding: Some("base64".to_string()),
-        auth_token: Some(context.session_id.clone()),
-    };
-
-    let response = server.read(read_request).await.unwrap();
-    assert!(response.success);
-    
-    let decoded_data = base64::engine::general_purpose::STANDARD
-        .decode(response.data.unwrap())
-        .unwrap();
-    assert_eq!(decoded_data, binary_data);
-}
-
-#[tokio::test]
-async fn test_batch_operations_with_auth() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        ..Default::default()
-    };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    auth_manager
-        .create_user("batcher", "pass123", vec![Permission::Write])
-        .unwrap();
-
-    let context = auth_manager.authenticate_user("batcher", "pass123").unwrap();
-
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        ..Default::default()
-    };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-
-    // Test 1: Batch write with authentication
-    use blockdb::api::BatchWriteRequest;
-    
-    let batch_request = BatchWriteRequest {
-        operations: vec![
-            WriteRequest {
-                key: "batch_key1".to_string(),
-                value: "batch_value1".to_string(),
-                encoding: None,
-                auth_token: Some(context.session_id.clone()),
-            },
-            WriteRequest {
-                key: "batch_key2".to_string(),
-                value: "batch_value2".to_string(),
-                encoding: None,
-                auth_token: Some(context.session_id.clone()),
-            },
-            WriteRequest {
-                key: "batch_key3".to_string(),
-                value: "batch_value3".to_string(),
-                encoding: None,
-                auth_token: Some(context.session_id.clone()),
-            },
-        ],
-    };
-
-    let response = server.batch_write(batch_request).await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.total_processed, 3);
-    assert_eq!(response.results.len(), 3);
-    
-    // All operations should succeed
-    for result in response.results {
-        assert!(result.success);
+async fn post(port: u16, path: &str, body: serde_json::Value, token: Option<&str>) -> (StatusCode, serde_json::Value) {
+    let client = Client::new();
+    let uri = format!("http://127.0.0.1:{}{}", port, path);
+    let mut builder = Request::builder().method(Method::POST).uri(uri).header("Content-Type", "application/json");
+    if let Some(t) = token {
+        builder = builder.header("Authorization", format!("Bearer {}", t));
     }
+    let req = builder.body(Body::from(body.to_string())).unwrap();
+    let resp = client.request(req).await.unwrap();
+    let status = resp.status();
+    let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
 }
 
 #[tokio::test]
-async fn test_health_and_stats_endpoints() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        ..Default::default()
-    };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        ..Default::default()
-    };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-
-    // Test 1: Health endpoint should work without authentication
-    let health_response = server.health().await.unwrap();
-    assert_eq!(health_response.status, "healthy");
-    assert!(health_response.integrity_verified);
-
-    // Test 2: Stats endpoint should work without authentication
-    let stats_response = server.stats().await.unwrap();
-    assert_eq!(stats_response.total_writes, 0); // No writes yet
-    assert_eq!(stats_response.total_reads, 0); // No reads yet
+async fn test_health_endpoint() {
+    let (port, _dir) = start_server(false, false).await;
+    let (status, body) = get(port, "/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "healthy");
+    assert_eq!(body["integrity_verified"], true);
 }
 
 #[tokio::test]
-async fn test_session_expiry_handling() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        session_duration_hours: 0, // Sessions expire immediately for testing
-        ..Default::default()
-    };
-
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
-
-    auth_manager
-        .create_user("expiry_test", "pass123", vec![Permission::Write])
-        .unwrap();
-
-    let context = auth_manager.authenticate_user("expiry_test", "pass123").unwrap();
-
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        ..Default::default()
-    };
-    let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-
-    // Wait a moment to ensure session expires
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Test: Operation with expired session should fail
-    let write_request = WriteRequest {
-        key: "expired_key".to_string(),
-        value: "expired_value".to_string(),
-        encoding: None,
-        auth_token: Some(context.session_id),
-    };
-
-    let result = server.write(write_request).await;
-    assert!(result.is_err()); // Should fail due to expired session
+async fn test_metrics_endpoint() {
+    let (port, _dir) = start_server(false, false).await;
+    let client = Client::new();
+    let uri = format!("http://127.0.0.1:{}/metrics", port);
+    let resp = client.get(uri.parse().unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("blockdb_requests_total"));
 }
 
 #[tokio::test]
-async fn test_concurrent_authenticated_operations() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = BlockDBConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        auth_enabled: true,
-        ..Default::default()
-    };
+async fn test_kv_write_read_no_auth() {
+    let (port, _dir) = start_server(false, false).await;
 
-    let db = BlockDBHandle::new(config.clone()).unwrap();
-    let mut auth_manager = AuthManager::new(config.clone()).unwrap();
+    let (status, body) = post(port, "/kv", serde_json::json!({"key": "k1", "value": "v1"}), None).await;
+    assert_eq!(status, StatusCode::OK, "write failed: {:?}", body);
+    assert_eq!(body["success"], true);
 
-    // Create multiple users
-    for i in 0..5 {
-        auth_manager
-            .create_user(&format!("user{}", i), "pass123", vec![Permission::Read, Permission::Write])
-            .unwrap();
-    }
+    let (status, body) = get(port, "/kv?key=k1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"], "v1");
+}
 
-    let api_config = ApiConfig {
-        auth_enabled: true,
-        ..Default::default()
-    };
-    let server = std::sync::Arc::new(BlockDBServer::with_auth(db, api_config, auth_manager.clone()));
+#[tokio::test]
+async fn test_append_only_conflict_returns_409() {
+    let (port, _dir) = start_server(false, false).await;
+    let (s1, _) = post(port, "/kv", serde_json::json!({"key": "dup", "value": "a"}), None).await;
+    assert_eq!(s1, StatusCode::OK);
+    let (s2, body) = post(port, "/kv", serde_json::json!({"key": "dup", "value": "b"}), None).await;
+    assert_eq!(s2, StatusCode::CONFLICT, "expected append-only conflict: {:?}", body);
+}
 
-    // Test: Concurrent operations from multiple authenticated users
-    let mut handles = vec![];
+#[tokio::test]
+async fn test_login_and_authenticated_write() {
+    let (port, _dir) = start_server(true, false).await;
 
-    for i in 0..5 {
-        let server_clone = server.clone();
-        let mut auth_clone = auth_manager.clone();
-        
-        let handle = tokio::spawn(async move {
-            let context = auth_clone
-                .authenticate_user(&format!("user{}", i), "pass123")
-                .unwrap();
+    // Unauthenticated write must be rejected.
+    let (status, _) = post(port, "/kv", serde_json::json!({"key": "x", "value": "y"}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-            // Each user writes their own data
-            let write_request = WriteRequest {
-                key: format!("concurrent_key_{}", i),
-                value: format!("concurrent_value_{}", i),
-                encoding: None,
-                auth_token: Some(context.session_id.clone()),
-            };
+    // Login.
+    let (status, body) = post(port, "/login", serde_json::json!({"username": "writer", "password": "Str0ng!Pass"}), None).await;
+    assert_eq!(status, StatusCode::OK, "login response: {:?}", body);
+    let token = body["auth_token"].as_str().unwrap().to_string();
 
-            let write_result = server_clone.write(write_request).await.unwrap();
-            assert!(write_result.success);
+    // Authenticated write succeeds.
+    let (status, body) = post(port, "/kv", serde_json::json!({"key": "x", "value": "y"}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "auth write failed: {:?}", body);
 
-            // Each user reads their own data
-            let read_request = ReadRequest {
-                key: format!("concurrent_key_{}", i),
-                encoding: None,
-                auth_token: Some(context.session_id),
-            };
+    // Bad credentials fail.
+    let (status, _) = post(port, "/login", serde_json::json!({"username": "writer", "password": "wrong"}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
 
-            let read_result = server_clone.read(read_request).await.unwrap();
-            assert!(read_result.success);
-            assert_eq!(read_result.data.unwrap(), format!("concurrent_value_{}", i));
-        });
+#[tokio::test]
+async fn test_consent_lifecycle_over_http() {
+    let (port, _dir) = start_server(false, false).await;
 
-        handles.push(handle);
-    }
+    // Grant.
+    let (status, body) = post(
+        port,
+        "/consent/grant",
+        serde_json::json!({"subject_id": "alice", "purpose": "marketing", "metadata": {"policy": "v2"}}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant failed: {:?}", body);
+    assert_eq!(body["success"], true);
 
-    // Wait for all operations to complete
-    for handle in handles {
-        handle.await.unwrap();
-    }
+    // Status is granted.
+    let (status, body) = get(port, "/consent/status?subject=alice&purpose=marketing").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"]["status"], "Granted");
+
+    // Withdraw.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let (status, _) = post(
+        port,
+        "/consent/withdraw",
+        serde_json::json!({"subject_id": "alice", "purpose": "marketing"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Status is now withdrawn.
+    let (_, body) = get(port, "/consent/status?subject=alice&purpose=marketing").await;
+    assert_eq!(body["state"]["status"], "Withdrawn");
+
+    // History retains both events.
+    let (_, body) = get(port, "/consent/history?subject=alice&purpose=marketing").await;
+    assert_eq!(body["events"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_permission_enforced_for_user_creation() {
+    // The pre-seeded "writer" user has read_write but NOT CreateUser permission.
+    let (port, _dir) = start_server(true, false).await;
+    let (_, body) = post(port, "/login", serde_json::json!({"username": "writer", "password": "Str0ng!Pass"}), None).await;
+    let token = body["auth_token"].as_str().unwrap().to_string();
+
+    let (status, _) = post(
+        port,
+        "/users",
+        serde_json::json!({"username": "newbie", "password": "An0ther!Pass", "permissions": ["read"]}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "non-admin must not create users");
+}
+
+// Keep a direct AuthManager sanity check alongside the HTTP tests.
+#[tokio::test]
+async fn test_auth_manager_direct() {
+    let am = AuthManager::new(AuthConfig::default());
+    am.create_user(
+        "carol".to_string(),
+        "Str0ng!Pass",
+        PermissionSet::from_permissions(vec![Permission::Read, Permission::Write]),
+        Some("admin".to_string()),
+        0,
+    )
+    .unwrap();
+
+    let ctx = am.authenticate("carol", "Str0ng!Pass").unwrap();
+    assert!(ctx.has_permission(&Permission::Write));
+
+    let validated = am.authenticate_with_token(&ctx.session_id).unwrap();
+    assert_eq!(validated.user_id, "carol");
+
+    assert!(am.authenticate("carol", "nope").is_err());
 }

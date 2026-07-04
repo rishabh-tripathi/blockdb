@@ -1,18 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{RwLock, Mutex, mpsc};
-use tokio::time::{interval, sleep, timeout};
+use tokio::time::{interval, timeout};
 use async_trait::async_trait;
 use rand::Rng;
-use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
 use crate::consensus::{
-    NodeId, NodeAddress, ClusterConfig, RaftState, Term, ConsensusMessage, 
-    ConsensusEngine, ConsensusState
+    NodeId, NodeAddress, ClusterConfig, RaftState, Term, ConsensusMessage,
+    ConsensusEngine, ConsensusState, StateMachine,
 };
 use crate::consensus::log_entry::{LogEntry, LogOperation, ReplicatedLog};
+use crate::consensus::transport::{NoopTransport, RaftTransport};
 use crate::error::BlockDBError;
 use crate::transaction::Operation;
 
@@ -26,12 +26,24 @@ pub struct RaftNode {
     message_receiver: Arc<Mutex<mpsc::UnboundedReceiver<(NodeId, ConsensusMessage)>>>,
     client_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), BlockDBError>>>>>,
     is_running: Arc<RwLock<bool>>,
+    /// Delivers outbound messages to peers (HTTP in production, no-op for local tests).
+    transport: Arc<dyn RaftTransport>,
+    /// Applies committed log entries to the replicated store.
+    state_machine: Arc<dyn StateMachine>,
+    /// Peers that granted their vote in the current election (leader elected at majority).
+    votes_received: Arc<Mutex<HashSet<NodeId>>>,
 }
 
 impl RaftNode {
-    pub fn new(config: ClusterConfig) -> Self {
+    /// Construct a node with an explicit transport and state machine (the real
+    /// multi-node configuration).
+    pub fn new(
+        config: ClusterConfig,
+        transport: Arc<dyn RaftTransport>,
+        state_machine: Arc<dyn StateMachine>,
+    ) -> Self {
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
-        
+
         RaftNode {
             config,
             state: Arc::new(RwLock::new(ConsensusState::new())),
@@ -42,7 +54,27 @@ impl RaftNode {
             message_receiver: Arc::new(Mutex::new(message_receiver)),
             client_requests: Arc::new(Mutex::new(HashMap::new())),
             is_running: Arc::new(RwLock::new(false)),
+            transport,
+            state_machine,
+            votes_received: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Construct a node with a no-op transport and no-op state machine. Useful for
+    /// smoke tests of the local state machine without networking or storage.
+    pub fn new_local(config: ClusterConfig) -> Self {
+        Self::new(config, Arc::new(NoopTransport), Arc::new(NoopStateMachine))
+    }
+
+    /// A handle for injecting messages received over the network into this node's
+    /// processing queue (used by the cluster server's `/raft/message` endpoint).
+    pub fn message_injector(&self) -> mpsc::UnboundedSender<(NodeId, ConsensusMessage)> {
+        self.message_sender.clone()
+    }
+
+    /// Inject a message received from `from` into the processing queue.
+    pub fn inject(&self, from: NodeId, message: ConsensusMessage) {
+        let _ = self.message_sender.send((from, message));
     }
     
     pub async fn start(&self) -> Result<(), BlockDBError> {
@@ -129,7 +161,7 @@ impl RaftNode {
                 self.handle_append_entries_response(sender, term, success, match_index).await;
             }
             ConsensusMessage::ClientRequest { operation, request_id } => {
-                self.handle_client_request(operation, request_id).await;
+                let _ = self.handle_client_request(operation, request_id).await;
             }
             ConsensusMessage::ClientResponse { request_id, success, error } => {
                 self.handle_client_response(request_id, success, error).await;
@@ -183,18 +215,21 @@ impl RaftNode {
         
         // Only process if we're a candidate in the same term
         if matches!(state.state, RaftState::Candidate) && term.0 == state.current_term.0 && vote_granted {
-            // Count votes (including our own)
-            let votes_received = 1; // TODO: Track actual votes received
-            
+            // Record this peer's vote and count the distinct votes (including our own).
+            let votes_received = {
+                let mut votes = self.votes_received.lock().await;
+                votes.insert(sender);
+                votes.len()
+            };
+
             if votes_received >= self.config.majority() {
-                // Become leader
+                // Won the election: become leader for this term.
                 state.become_leader(self.config.node_id.clone());
                 drop(state);
-                
-                // Initialize leader state
+
                 self.initialize_leader_state().await;
-                
-                // Send initial heartbeats
+                // Immediately assert leadership with heartbeats so followers stop
+                // their election timers.
                 self.send_heartbeats().await;
             }
         }
@@ -240,10 +275,16 @@ impl RaftNode {
             success,
             match_index: if success { log.last_log_index() } else { 0 },
         };
-        
+
         drop(state);
         drop(log);
-        
+
+        // If the leader advanced our commit index, apply the newly-committed entries
+        // to our local state machine so this follower stays consistent with the leader.
+        if success {
+            self.apply_committed().await;
+        }
+
         self.send_message(sender, response).await;
     }
     
@@ -287,81 +328,62 @@ impl RaftNode {
         }
     }
     
-    async fn handle_client_request(&self, operation: Operation, request_id: Uuid) {
-        let state = self.state.read().await;
-        
-        if !matches!(state.state, RaftState::Leader) {
-            // Not the leader, reject request
-            let response = ConsensusMessage::ClientResponse {
-                request_id,
-                success: false,
-                error: Some("Not the leader".to_string()),
-            };
-            
-            // TODO: Send to client
-            return;
+    async fn handle_client_request(&self, operation: Operation, request_id: Uuid) -> Result<(), BlockDBError> {
+        {
+            let state = self.state.read().await;
+            if !matches!(state.state, RaftState::Leader) {
+                return Err(BlockDBError::ConsensusError("not the leader".to_string()));
+            }
         }
-        
-        drop(state);
-        
-        // Convert operation to log operation
+
+        // Only writes go through the replicated log.
         let log_operation = match operation {
             Operation::Put { key, value } => LogOperation::Put { key, value },
-            _ => {
-                // For now, only support Put operations in consensus
-                let response = ConsensusMessage::ClientResponse {
-                    request_id,
-                    success: false,
-                    error: Some("Operation not supported".to_string()),
-                };
-                return;
+            other => {
+                return Err(BlockDBError::ConsensusError(format!(
+                    "operation not supported by consensus: {:?}",
+                    other
+                )))
             }
         };
-        
-        // Add to log
-        let mut log = self.log.write().await;
-        let state = self.state.read().await;
-        
-        let entry = LogEntry::new(
-            log.last_log_index() + 1,
-            state.current_term.clone(),
-            log_operation,
-            request_id,
-        );
-        
-        log.append(entry);
-        
-        drop(log);
-        drop(state);
-        
-        // Store client request for response
+
+        // Append the entry to the leader's log.
+        {
+            let mut log = self.log.write().await;
+            let state = self.state.read().await;
+            let entry = LogEntry::new(
+                log.last_log_index() + 1,
+                state.current_term.clone(),
+                log_operation,
+                request_id,
+            );
+            log.append(entry);
+        }
+
+        // Register a waiter that apply_committed() will signal once this entry commits.
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut client_requests = self.client_requests.lock().await;
             client_requests.insert(request_id, tx);
         }
-        
-        // Replicate to followers
+
+        // Replicate to followers, then try to advance the commit index. For a
+        // single-node cluster (majority == 1) this commits and applies immediately;
+        // for a multi-node cluster the commit happens once a majority acknowledges.
         self.replicate_to_followers().await;
-        
-        // Wait for commitment or timeout
-        let timeout_duration = Duration::from_secs(5);
+        self.update_commit_index().await;
+
+        // Wait for the entry to be committed and applied (or time out).
+        let timeout_duration = self.config.election_timeout * 10;
         match timeout(timeout_duration, rx).await {
-            Ok(Ok(())) => {
-                let response = ConsensusMessage::ClientResponse {
-                    request_id,
-                    success: true,
-                    error: None,
-                };
-                // TODO: Send to client
-            }
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(e),
             _ => {
-                let response = ConsensusMessage::ClientResponse {
-                    request_id,
-                    success: false,
-                    error: Some("Request timeout".to_string()),
-                };
-                // TODO: Send to client
+                // Clean up the waiter so a late commit doesn't try to signal a dropped rx.
+                self.client_requests.lock().await.remove(&request_id);
+                Err(BlockDBError::ConsensusError(
+                    "timed out waiting for entry to commit".to_string(),
+                ))
             }
         }
     }
@@ -385,10 +407,23 @@ impl RaftNode {
         let log = self.log.read().await;
         
         state.become_candidate();
-        
-        // Vote for self
+
+        // Vote for self and reset the vote tally for this new election term.
         state.voted_for = Some(self.config.node_id.clone());
-        
+        {
+            let mut votes = self.votes_received.lock().await;
+            votes.clear();
+            votes.insert(self.config.node_id.clone());
+        }
+
+        // A single-node cluster wins its own election immediately.
+        if self.config.majority() <= 1 {
+            state.become_leader(self.config.node_id.clone());
+            drop(state);
+            self.initialize_leader_state().await;
+            return;
+        }
+
         let request = ConsensusMessage::RequestVote {
             term: state.current_term.clone(),
             candidate_id: self.config.node_id.clone(),
@@ -472,8 +507,9 @@ impl RaftNode {
         
         let current_commit = log.get_commit_index();
         let last_log_index = log.last_log_index();
-        
-        // Find highest index that majority of servers have replicated
+        let mut highest_committable: Option<u64> = None;
+
+        // Find the highest index that a majority of servers have replicated.
         for n in (current_commit + 1)..=last_log_index {
             let mut count = 1; // Count self
             
@@ -484,37 +520,27 @@ impl RaftNode {
             }
             
             if count >= self.config.majority() {
-                // Check that the entry is from current term
+                // Raft safety: a leader only commits entries from its *current* term
+                // (older entries commit indirectly once a current-term entry does).
                 if let Some(term) = log.get_term(n) {
                     if term.0 == state.current_term.0 {
-                        drop(log);
-                        drop(match_index);
-                        drop(state);
-                        
-                        // Update commit index
-                        let mut log = self.log.write().await;
-                        log.update_commit_index(n);
-                        
-                        // Notify committed requests
-                        self.notify_committed_requests(&*log).await;
-                        return;
+                        highest_committable = Some(n);
                     }
                 }
             }
         }
-    }
-    
-    async fn notify_committed_requests(&self, log: &ReplicatedLog) {
-        let last_applied = log.get_last_applied();
-        let commit_index = log.get_commit_index();
-        
-        for index in (last_applied + 1)..=commit_index {
-            if let Some(entry) = log.get_entry(index) {
-                let mut client_requests = self.client_requests.lock().await;
-                if let Some(sender) = client_requests.remove(&entry.request_id) {
-                    let _ = sender.send(Ok(()));
-                }
+
+        drop(log);
+        drop(match_index);
+        drop(state);
+
+        if let Some(n) = highest_committable {
+            {
+                let mut log = self.log.write().await;
+                log.update_commit_index(n);
             }
+            // Apply everything now committed to the state machine and wake waiters.
+            self.apply_committed().await;
         }
     }
     
@@ -530,27 +556,80 @@ impl RaftNode {
     }
     
     async fn send_message(&self, target: NodeId, message: ConsensusMessage) {
-        // In a real implementation, this would send over the network
-        // For now, just send to local channel for testing
-        let _ = self.message_sender.send((target, message));
+        // Messages addressed to ourselves loop back through the local queue; messages
+        // to peers go over the transport (HTTP) to their `/raft/message` endpoint.
+        if target == self.config.node_id {
+            let _ = self.message_sender.send((self.config.node_id.clone(), message));
+            return;
+        }
+
+        if let Some(address) = self.config.peers.get(&target) {
+            let transport = self.transport.clone();
+            let from = self.config.node_id.clone();
+            let address = address.clone();
+            // Fire-and-forget: don't block the state machine on network I/O.
+            tokio::spawn(async move {
+                transport.send(&address, from, message).await;
+            });
+        }
+    }
+
+    /// Apply all newly-committed log entries to the state machine, in order, and wake
+    /// any client requests waiting on them. Idempotent: `apply_up_to` advances
+    /// `last_applied` so each entry is applied exactly once across all callers.
+    async fn apply_committed(&self) {
+        let entries = {
+            let mut log = self.log.write().await;
+            let commit_index = log.get_commit_index();
+            log.apply_up_to(commit_index)
+        };
+
+        for entry in entries {
+            // Apply deterministically on every node. For an append-only store, a
+            // duplicate key is rejected identically on all nodes, so the outcome stays
+            // consistent cluster-wide; the proposing client receives that same result.
+            let apply_result = self.state_machine.apply(&entry).await;
+            if let Err(ref e) = apply_result {
+                tracing::debug!(index = entry.index, error = %e, "state machine apply returned error");
+            }
+
+            // Wake the client that proposed this entry, if any (leader side).
+            let mut client_requests = self.client_requests.lock().await;
+            if let Some(sender) = client_requests.remove(&entry.request_id) {
+                let _ = sender.send(apply_result);
+            }
+        }
+    }
+}
+
+/// A state machine that ignores everything. Paired with `RaftNode::new_local`.
+pub struct NoopStateMachine;
+
+#[async_trait]
+impl StateMachine for NoopStateMachine {
+    async fn apply(&self, _entry: &LogEntry) -> Result<(), BlockDBError> {
+        Ok(())
     }
 }
 
 impl Clone for RaftNode {
     fn clone(&self) -> Self {
-        // Create new channels for the clone
-        let (message_sender, message_receiver) = mpsc::unbounded_channel();
-        
+        // Share the SAME message channel and all state so a clone (e.g. the one the
+        // run loop is spawned on) sees messages injected via the original handle.
+        // Cloning an mpsc sender points at the same channel; the receiver Arc is shared.
         RaftNode {
             config: self.config.clone(),
             state: self.state.clone(),
             log: self.log.clone(),
             next_index: self.next_index.clone(),
             match_index: self.match_index.clone(),
-            message_sender,
-            message_receiver: Arc::new(Mutex::new(message_receiver)),
+            message_sender: self.message_sender.clone(),
+            message_receiver: self.message_receiver.clone(),
             client_requests: self.client_requests.clone(),
             is_running: self.is_running.clone(),
+            transport: self.transport.clone(),
+            state_machine: self.state_machine.clone(),
+            votes_received: self.votes_received.clone(),
         }
     }
 }
@@ -558,22 +637,9 @@ impl Clone for RaftNode {
 #[async_trait]
 impl ConsensusEngine for RaftNode {
     async fn propose(&self, operation: Operation) -> Result<(), BlockDBError> {
+        // Drive the write through the replicated log and wait for it to commit + apply.
         let request_id = Uuid::new_v4();
-        
-        let message = ConsensusMessage::ClientRequest {
-            operation,
-            request_id,
-        };
-        
-        self.handle_client_request(
-            match message {
-                ConsensusMessage::ClientRequest { operation, .. } => operation,
-                _ => unreachable!(),
-            },
-            request_id,
-        ).await;
-        
-        Ok(())
+        self.handle_client_request(operation, request_id).await
     }
     
     async fn is_leader(&self) -> bool {
@@ -586,13 +652,17 @@ impl ConsensusEngine for RaftNode {
         state.leader_id.clone()
     }
     
-    async fn add_node(&self, node_id: NodeId, address: NodeAddress) -> Result<(), BlockDBError> {
+    async fn add_node(&self, _node_id: NodeId, _address: NodeAddress) -> Result<(), BlockDBError> {
         // TODO: Implement cluster membership changes
         Ok(())
     }
     
-    async fn remove_node(&self, node_id: &NodeId) -> Result<(), BlockDBError> {
+    async fn remove_node(&self, _node_id: &NodeId) -> Result<(), BlockDBError> {
         // TODO: Implement cluster membership changes
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

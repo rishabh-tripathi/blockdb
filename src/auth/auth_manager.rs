@@ -185,7 +185,7 @@ impl AuthManager {
         Ok(auth_context)
     }
 
-    pub fn authenticate_with_token(&self, session_id: &SessionId) -> Result<AuthContext, AuthError> {
+    pub fn authenticate_with_token(&self, session_id: &str) -> Result<AuthContext, AuthError> {
         if !self.is_enabled() {
             return Err(AuthError::CryptographicError("Authentication is disabled".to_string()));
         }
@@ -193,7 +193,7 @@ impl AuthManager {
         let sessions = self.active_sessions.read().unwrap();
         let auth_context = sessions
             .get(session_id)
-            .ok_or_else(|| AuthError::SessionNotFound(session_id.clone()))?;
+            .ok_or_else(|| AuthError::SessionNotFound(session_id.to_string()))?;
 
         if auth_context.is_expired() {
             return Err(AuthError::TokenExpired);
@@ -202,7 +202,7 @@ impl AuthManager {
         Ok(auth_context.clone())
     }
 
-    pub fn logout(&self, session_id: &SessionId) -> Result<(), AuthError> {
+    pub fn logout(&self, session_id: &str) -> Result<(), AuthError> {
         let mut sessions = self.active_sessions.write().unwrap();
         sessions.remove(session_id);
         Ok(())

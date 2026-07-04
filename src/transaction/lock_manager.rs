@@ -176,8 +176,8 @@ impl LockManager {
                     self.transaction_locks
                         .entry(transaction_id.clone())
                         .or_insert_with(HashSet::new)
-                        .insert(key_vec);
-                    
+                        .insert(key_vec.clone());
+
                     // Remove from deadlock detector
                     let mut detector = self.deadlock_detector.lock();
                     detector.remove_wait_edge(transaction_id, &key_vec);

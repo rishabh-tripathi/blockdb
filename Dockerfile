@@ -1,6 +1,6 @@
 # Multi-stage Docker build for BlockDB
 # Stage 1: Build environment
-FROM rust:1.75-slim as builder
+FROM rust:1.82-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -12,20 +12,22 @@ RUN apt-get update && apt-get install -y \
 # Create app directory
 WORKDIR /app
 
-# Copy dependency files first for better caching
+# Copy dependency manifests first for better layer caching.
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create stub sources for every target declared in Cargo.toml (lib + both bins)
+# so the dependency-only build succeeds, then remove them before the real build.
+RUN mkdir -p src/bin && \
+    echo "" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/server.rs && \
+    echo "fn main() {}" > src/bin/simple_cli.rs && \
+    echo "fn main() {}" > src/bin/node.rs && \
+    cargo build --release && \
+    rm -rf src
 
-# Build dependencies (cached layer)
-RUN cargo build --release && rm -rf src
-
-# Copy source code
+# Copy the real source code and build the application.
 COPY src ./src
-
-# Build the actual application
-RUN cargo build --release
+RUN cargo build --release --bin blockdb-server --bin blockdb-cli --bin blockdb-node
 
 # Stage 2: Runtime environment
 FROM debian:bookworm-slim
@@ -47,6 +49,7 @@ RUN mkdir -p /var/lib/blockdb /var/log/blockdb /etc/blockdb && \
 # Copy binaries from builder stage
 COPY --from=builder /app/target/release/blockdb-server /usr/local/bin/
 COPY --from=builder /app/target/release/blockdb-cli /usr/local/bin/
+COPY --from=builder /app/target/release/blockdb-node /usr/local/bin/
 
 # Copy configuration
 COPY docker/blockdb.toml /etc/blockdb/blockdb.toml

@@ -150,6 +150,9 @@ impl AuthContext {
     }
 
     pub fn has_permission(&self, required: &Permission) -> bool {
-        self.permissions.contains(required)
+        // Use the permission hierarchy (Admin implies all, Write implies Read, etc.)
+        // so an admin session is correctly recognized as holding every permission,
+        // consistent with PermissionSet::has_permission.
+        self.permissions.iter().any(|p| p.implies(required))
     }
 }

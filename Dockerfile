@@ -17,16 +17,19 @@ COPY Cargo.toml Cargo.lock ./
 
 # Create stub sources for every target declared in Cargo.toml (lib + both bins)
 # so the dependency-only build succeeds, then remove them before the real build.
-RUN mkdir -p src/bin && \
+RUN mkdir -p src/bin benches && \
     echo "" > src/lib.rs && \
     echo "fn main() {}" > src/bin/server.rs && \
     echo "fn main() {}" > src/bin/simple_cli.rs && \
     echo "fn main() {}" > src/bin/node.rs && \
+    echo "fn main() {}" > benches/comprehensive_benchmarks.rs && \
     cargo build --release && \
-    rm -rf src
+    rm -rf src benches
 
-# Copy the real source code and build the application.
+# Copy the real source code and build the application. `benches/` is copied so the
+# manifest's declared bench target resolves during parsing (it is not compiled here).
 COPY src ./src
+COPY benches ./benches
 RUN cargo build --release --bin blockdb-server --bin blockdb-cli --bin blockdb-node
 
 # Stage 2: Runtime environment

@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use blockdb::{BlockDBHandle, BlockDBConfig, AuthManager, Permission};
-use blockdb::api::{BlockDBServer, ApiConfig, WriteRequest, ReadRequest, LoginRequest};
+use blockdb::auth::{AuthConfig, PermissionSet};
 use tempfile::TempDir;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -38,7 +38,8 @@ fn bench_sequential_writes(c: &mut Criterion) {
                     
                     for i in 0..size {
                         let key = format!("bench_key_{}", i);
-                        let value = format!("bench_value_{}_{'x'.repeat(100)}", i); // ~120 bytes per value
+                        let padding = "x".repeat(100);
+                        let value = format!("bench_value_{}_{}", i, padding); // ~120 bytes per value
                         
                         db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
                     }
@@ -235,14 +236,14 @@ fn bench_authentication_operations(c: &mut Criterion) {
                     ..Default::default()
                 };
                 
-                let mut auth_manager = AuthManager::new(config).unwrap();
+                let mut auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
                 
                 for i in 0..100 {
                     let username = format!("bench_user_{}", i);
                     let password = format!("bench_pass_{}", i);
                     let permissions = vec![Permission::Read, Permission::Write];
                     
-                    auth_manager.create_user(&username, &password, permissions).unwrap();
+                    auth_manager.create_user(username.clone(), &password, PermissionSet::from_permissions(permissions), None, 0).unwrap();
                 }
                 
                 black_box(auth_manager);
@@ -260,20 +261,20 @@ fn bench_authentication_operations(c: &mut Criterion) {
                     ..Default::default()
                 };
                 
-                let mut auth_manager = AuthManager::new(config).unwrap();
+                let mut auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
                 
                 // Pre-create users
                 for i in 0..100 {
                     let username = format!("auth_user_{}", i);
                     let password = format!("auth_pass_{}", i);
-                    auth_manager.create_user(&username, &password, vec![Permission::Read]).unwrap();
+                    auth_manager.create_user(username.clone(), &password, PermissionSet::from_permissions(vec![Permission::Read]), None, 0).unwrap();
                 }
                 
                 // Benchmark authentication
                 for i in 0..100 {
                     let username = format!("auth_user_{}", i);
                     let password = format!("auth_pass_{}", i);
-                    let context = auth_manager.authenticate_user(&username, &password).unwrap();
+                    let context = auth_manager.authenticate(&username, &password).unwrap();
                     black_box(context);
                 }
             })
@@ -290,16 +291,16 @@ fn bench_authentication_operations(c: &mut Criterion) {
                     ..Default::default()
                 };
                 
-                let mut auth_manager = AuthManager::new(config).unwrap();
+                let mut auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
                 
                 // Create user and get session
-                auth_manager.create_user("session_user", "session_pass", vec![Permission::Read]).unwrap();
-                let context = auth_manager.authenticate_user("session_user", "session_pass").unwrap();
+                auth_manager.create_user("session_user".to_string(), "session_pass", PermissionSet::from_permissions(vec![Permission::Read]), None, 0).unwrap();
+                let context = auth_manager.authenticate("session_user", "session_pass").unwrap();
                 let session_id = context.session_id.clone();
                 
                 // Benchmark session validation
                 for _ in 0..1000 {
-                    let validated = auth_manager.validate_session(&session_id).unwrap();
+                    let validated = auth_manager.authenticate_with_token(&session_id).unwrap();
                     black_box(validated);
                 }
             })
@@ -312,10 +313,12 @@ fn bench_authentication_operations(c: &mut Criterion) {
 fn bench_api_layer_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("api_layer");
     group.throughput(Throughput::Elements(1000));
-    
+
     let rt = Runtime::new().unwrap();
 
-    group.bench_function("authenticated_api_writes", |b| {
+    // The write path with a per-write token validation (what the authenticated HTTP
+    // handler does before delegating to the store).
+    group.bench_function("authenticated_writes", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
@@ -325,64 +328,34 @@ fn bench_api_layer_performance(c: &mut Criterion) {
                     ..Default::default()
                 };
 
-                let db = BlockDBHandle::new(config.clone()).unwrap();
-                let mut auth_manager = AuthManager::new(config).unwrap();
-                
-                // Create user
-                auth_manager.create_user("api_user", "api_pass", vec![Permission::Write]).unwrap();
-                let context = auth_manager.authenticate_user("api_user", "api_pass").unwrap();
-                
-                let api_config = ApiConfig {
-                    auth_enabled: true,
-                    ..Default::default()
-                };
-                let server = BlockDBServer::with_auth(db, api_config, auth_manager);
-                
-                // Benchmark authenticated writes
+                let db = BlockDBHandle::new(config).unwrap();
+                let auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+                auth_manager.create_user("api_user".to_string(), "api_pass", PermissionSet::from_permissions(vec![Permission::Write]), None, 0).unwrap();
+                let context = auth_manager.authenticate("api_user", "api_pass").unwrap();
+
                 for i in 0..100 {
-                    let request = WriteRequest {
-                        key: format!("api_key_{}", i),
-                        value: format!("api_value_{}", i),
-                        encoding: None,
-                        auth_token: Some(context.session_id.clone()),
-                    };
-                    
-                    let response = server.write(request).await.unwrap();
-                    black_box(response);
+                    // Validate the session token, then write (mirrors the HTTP handler).
+                    let ctx = auth_manager.authenticate_with_token(&context.session_id).unwrap();
+                    black_box(ctx.has_permission(&Permission::Write));
+                    let key = format!("api_key_{}", i);
+                    let value = format!("api_value_{}", i);
+                    db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
                 }
             })
         })
     });
 
-    group.bench_function("unauthenticated_api_writes", |b| {
+    // The raw write path with auth disabled.
+    group.bench_function("unauthenticated_writes", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let config = BlockDBConfig {
-                    data_dir: temp_dir.path().to_string_lossy().to_string(),
-                    auth_enabled: false,
-                    ..Default::default()
-                };
-
-                let db = BlockDBHandle::new(config).unwrap();
-                let api_config = ApiConfig {
-                    auth_enabled: false,
-                    ..Default::default()
-                };
-                let server = BlockDBServer::new(db, api_config);
-                
-                // Benchmark unauthenticated writes
+                let (db, _temp_dir) = create_test_db();
                 for i in 0..100 {
-                    let request = WriteRequest {
-                        key: format!("unauth_key_{}", i),
-                        value: format!("unauth_value_{}", i),
-                        encoding: None,
-                        auth_token: None,
-                    };
-                    
-                    let response = server.write(request).await.unwrap();
-                    black_box(response);
+                    let key = format!("unauth_key_{}", i);
+                    let value = format!("unauth_value_{}", i);
+                    db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
                 }
+                black_box(db);
             })
         })
     });

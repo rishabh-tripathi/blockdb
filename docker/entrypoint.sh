@@ -109,6 +109,15 @@ case "$1" in
         # Start the server
         exec blockdb-server --config /tmp/blockdb.toml
         ;;
+    node)
+        # Run a Raft cluster member. blockdb-node reads BLOCKDB_NODE_ID,
+        # BLOCKDB_HOST, BLOCKDB_PORT, BLOCKDB_DATA_DIR and BLOCKDB_PEERS
+        # (comma-separated id@host:port list, including this node) from the
+        # environment. This is the mode to use for a consistent multi-node cluster.
+        echo "Starting BlockDB cluster node..."
+        init_data_dir
+        exec blockdb-node
+        ;;
     cli)
         shift
         exec blockdb-cli "$@"

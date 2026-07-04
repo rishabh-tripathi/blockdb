@@ -21,12 +21,13 @@ RUN mkdir -p src/bin && \
     echo "" > src/lib.rs && \
     echo "fn main() {}" > src/bin/server.rs && \
     echo "fn main() {}" > src/bin/simple_cli.rs && \
+    echo "fn main() {}" > src/bin/node.rs && \
     cargo build --release && \
     rm -rf src
 
 # Copy the real source code and build the application.
 COPY src ./src
-RUN cargo build --release --bin blockdb-server --bin blockdb-cli
+RUN cargo build --release --bin blockdb-server --bin blockdb-cli --bin blockdb-node
 
 # Stage 2: Runtime environment
 FROM debian:bookworm-slim
@@ -48,6 +49,7 @@ RUN mkdir -p /var/lib/blockdb /var/log/blockdb /etc/blockdb && \
 # Copy binaries from builder stage
 COPY --from=builder /app/target/release/blockdb-server /usr/local/bin/
 COPY --from=builder /app/target/release/blockdb-cli /usr/local/bin/
+COPY --from=builder /app/target/release/blockdb-node /usr/local/bin/
 
 # Copy configuration
 COPY docker/blockdb.toml /etc/blockdb/blockdb.toml

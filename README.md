@@ -60,10 +60,13 @@ cargo build --release
 - **GDPR-Friendly**: Purpose-scoped consent per data subject with rich metadata
 
 ### Distributed System Features
-- **ACID Transactions**: Transaction manager with 2PC coordinator (single-node today)
+- **Raft Consensus (multi-node)**: Real HTTP transport, leader election, log
+  replication, and majority commit — writes are linearized through the leader and
+  applied to every node's storage in the same order
+- **Strong Consistency**: All nodes converge on an identical view; follower writes
+  are transparently forwarded to the leader
+- **ACID Transactions**: Transaction manager with 2PC coordinator
 - **Fine-Grained Locking**: Deadlock detection and prevention
-- **Raft Foundation**: Consensus state machine and replicated log (⚠️ in-process transport
-  only — multi-node networking is not yet implemented; run single-node for production)
 
 ### Enterprise Features
 - **Strong Consistency**: Serialized append-only writes on a single node
@@ -149,6 +152,34 @@ assert!(consent.is_granted("alice", "marketing").await?);
 consent.withdraw("alice", "marketing", BTreeMap::new()).await?;
 let history = consent.history("alice", "marketing").await?; // both events retained
 ```
+
+### Multi-Node Cluster
+
+BlockDB is an immutable, append-only key/value store that replicates via Raft. Run
+one `blockdb-node` process per member; each owns a durable local store and talks to
+its peers over HTTP. Writes are linearized through the elected leader, replicated to
+a majority, then applied to every node — so all nodes stay strongly consistent. A
+write sent to a follower is forwarded to the leader automatically.
+
+```bash
+# Node 0 (repeat per node with its own --node-id / --port / --data-dir)
+blockdb-node --node-id node0 --host 0.0.0.0 --port 8080 \
+  --peers node0@10.0.0.1:8080,node1@10.0.0.2:8080,node2@10.0.0.3:8080 \
+  --data-dir /var/lib/blockdb
+
+# Write to any node (followers forward to the leader)
+curl -X POST http://10.0.0.2:8080/kv -d '{"key":"user:1","value":"alice"}'
+
+# Read from any node (local, eventually-consistent reads)
+curl 'http://10.0.0.3:8080/kv?key=user:1'
+
+# Cluster/leadership status
+curl http://10.0.0.1:8080/status
+```
+
+A 3-node cluster tolerates 1 node failure (majority = 2); a 5-node cluster tolerates
+2. Use an odd number of nodes. Reads are served locally for low latency; route reads
+to the leader if you require linearizable reads.
 
 ### Operational Endpoints
 

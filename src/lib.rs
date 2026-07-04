@@ -6,6 +6,7 @@ pub mod transaction;
 pub mod distributed;
 pub mod auth;
 pub mod consent;
+pub mod cluster;
 
 pub use storage::{BlockDB, BlockDBConfig, Record};
 pub use api::{BlockDBServer, ApiConfig};
@@ -15,6 +16,7 @@ pub use transaction::{TransactionManager, TransactionId, Operation};
 pub use consensus::{NodeId, NodeAddress, ClusterConfig};
 pub use auth::{AuthManager, AuthContext, AuthError, Permission, PermissionSet, CryptoIdentity, AuthenticatedDistributedBlockDB};
 pub use consent::{ConsentStore, ConsentEvent, ConsentState, ConsentStatus};
+pub use cluster::ClusterNode;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

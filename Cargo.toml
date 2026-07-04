@@ -22,7 +22,7 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 argon2 = "0.5"
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive", "env"] }
 dashmap = "5.5"
 parking_lot = "0.12"
 crossbeam = "0.8"
@@ -53,6 +53,10 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "blockdb-cli"
 path = "src/bin/simple_cli.rs"
+
+[[bin]]
+name = "blockdb-node"
+path = "src/bin/node.rs"
 
 [[bench]]
 name = "comprehensive_benchmarks"

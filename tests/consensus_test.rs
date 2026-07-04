@@ -41,7 +41,7 @@ fn test_node_address_url() {
 
 #[tokio::test]
 async fn test_raft_node_starts_and_stops() {
-    let node = RaftNode::new(single_node_config());
+    let node = RaftNode::new_local(single_node_config());
     node.start().await.unwrap();
 
     // Membership changes are accepted (no-ops today) and the engine reports a leader view.
@@ -60,7 +60,7 @@ async fn test_raft_node_starts_and_stops() {
 
 #[tokio::test]
 async fn test_consensus_engine_propose_smoke() {
-    let node = RaftNode::new(single_node_config());
+    let node = RaftNode::new_local(single_node_config());
     node.start().await.unwrap();
 
     // Proposing is accepted by the local engine (single-node, in-process transport).

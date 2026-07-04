@@ -7,6 +7,16 @@ use uuid::Uuid;
 
 pub mod raft;
 pub mod log_entry;
+pub mod transport;
+
+/// A replicated state machine that applies committed Raft log entries.
+///
+/// The Raft layer guarantees each committed entry is applied exactly once, in log
+/// order, on every node — giving all nodes an identical, consistent view of the data.
+#[async_trait::async_trait]
+pub trait StateMachine: Send + Sync {
+    async fn apply(&self, entry: &log_entry::LogEntry) -> Result<(), crate::error::BlockDBError>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);

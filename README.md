@@ -53,17 +53,24 @@ cargo build --release
 - **Collection Metadata**: Rich statistics and configuration per collection
 - **Tenant-Safe**: Perfect for multi-tenant applications
 
+### Consent Management (blockchain-backed)
+- **Event-Sourced Consent**: Every grant/withdrawal is an immutable, time-ordered event
+- **Tamper-Evident**: Each event carries a SHA-256 proof hash and is anchored in the blockchain
+- **Point-in-Time & Current State**: Query the latest status or the full audit history
+- **GDPR-Friendly**: Purpose-scoped consent per data subject with rich metadata
+
 ### Distributed System Features
-- **Raft Consensus**: Leader election and log replication
-- **ACID Transactions**: Full transaction support with 2PC
+- **ACID Transactions**: Transaction manager with 2PC coordinator (single-node today)
 - **Fine-Grained Locking**: Deadlock detection and prevention
-- **Cluster Management**: Dynamic node discovery and health monitoring
-- **Fault Tolerance**: Handles node failures and network partitions
+- **Raft Foundation**: Consensus state machine and replicated log (⚠️ in-process transport
+  only — multi-node networking is not yet implemented; run single-node for production)
 
 ### Enterprise Features
-- **Strong Consistency**: CP guarantee from CAP theorem
+- **Strong Consistency**: Serialized append-only writes on a single node
 - **Blockchain Audit Trail**: Immutable history with integrity verification
-- **Multi-Node Deployment**: Horizontal scaling capabilities
+- **Durable by Default**: WAL with per-write `fsync`, CRC-checked crash recovery, SSTable
+  reload on startup, and size-tiered compaction
+- **Observability**: Structured `tracing` logs, `/health`, `/stats`, and Prometheus `/metrics`
 - **Configurable Persistence**: Customizable storage and performance settings
 
 ## 🏗️ Architecture
@@ -97,6 +104,60 @@ BlockDB implements a layered architecture designed for scalability and reliabili
 │                 Write-Ahead Log (WAL)                      │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Consent Management API
+
+BlockDB ships a consent store built for privacy/GDPR use cases. Because the engine is
+append-only, consent is modeled as an immutable **event log**: each grant or withdrawal
+is a new, time-ordered, hash-proofed record, and the current state is derived from the
+latest event. Nothing is ever mutated in place, so the audit trail is tamper-evident by
+construction and anchored in the blockchain.
+
+**HTTP endpoints**
+
+```bash
+# Grant consent (metadata is optional, arbitrary key/values)
+curl -X POST http://localhost:8080/consent/grant \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_id":"alice","purpose":"marketing","metadata":{"policy":"v2"}}'
+
+# Withdraw consent
+curl -X POST http://localhost:8080/consent/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_id":"alice","purpose":"marketing"}'
+
+# Current status for a (subject, purpose)
+curl 'http://localhost:8080/consent/status?subject=alice&purpose=marketing'
+
+# Full immutable audit history
+curl 'http://localhost:8080/consent/history?subject=alice&purpose=marketing'
+
+# All purposes for a subject
+curl 'http://localhost:8080/consent/subject?subject=alice'
+```
+
+**Rust API** — see `examples/consent_demo.rs` (`cargo run --example consent_demo`):
+
+```rust
+use blockdb::{BlockDBConfig, BlockDBHandle, ConsentStore};
+use std::collections::BTreeMap;
+
+let db = BlockDBHandle::new(BlockDBConfig::default())?;
+let consent = ConsentStore::new(db);
+consent.grant("alice", "marketing", BTreeMap::new()).await?;
+assert!(consent.is_granted("alice", "marketing").await?);
+consent.withdraw("alice", "marketing", BTreeMap::new()).await?;
+let history = consent.history("alice", "marketing").await?; // both events retained
+```
+
+### Operational Endpoints
+
+- `GET /health` — liveness + blockchain integrity (503 if integrity fails)
+- `GET /stats` — JSON counters (writes, reads, consent events, auth failures)
+- `GET /metrics` — Prometheus text exposition
+- `POST /login` — obtain a bearer session token
+- `POST /users` — create a user (requires `CreateUser`/`Admin`)
+- `POST /kv` / `GET /kv?key=…` — key/value write/read (base64 encoding supported)
 
 ### Key Components
 

@@ -46,7 +46,8 @@ proptest! {
             // Property: Blockchain integrity should be maintained
             let integrity = db.verify_integrity().await.unwrap();
             prop_assert!(integrity);
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 
     #[test]
@@ -89,7 +90,8 @@ proptest! {
                 let result = db.get(&non_existent_key).await.unwrap();
                 prop_assert_eq!(result, None);
             }
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 
     #[test]
@@ -139,11 +141,17 @@ proptest! {
                 let integrity = db.verify_integrity().await.unwrap();
                 prop_assert!(integrity);
             }
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 }
 
 proptest! {
+    // These tests exercise the auth manager, which hashes passwords with Argon2id
+    // (deliberately expensive). Cap the number of generated cases so the suite stays
+    // fast in CI — a handful of cases is plenty to cover the permission/session logic.
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
     #[test]
     fn test_auth_permission_property(
         usernames in prop::collection::vec("[a-zA-Z][a-zA-Z0-9_]{2,19}", 1..10),
@@ -162,7 +170,7 @@ proptest! {
                 ..Default::default()
             };
 
-            let mut auth_manager = AuthManager::new(config).unwrap();
+            let mut auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
             let all_permissions = vec![
                 Permission::Read,
                 Permission::Write,
@@ -181,11 +189,11 @@ proptest! {
                     .collect();
 
                 // Create user
-                let result = auth_manager.create_user(username, password, permissions.clone());
+                let result = auth_manager.create_user(username.clone(), password, blockdb::auth::PermissionSet::from_permissions(permissions.clone()), None, 0);
                 
                 if result.is_ok() {
                     // Property: Created user should be able to authenticate
-                    let auth_result = auth_manager.authenticate_user(username, password);
+                    let auth_result = auth_manager.authenticate(username, password);
                     prop_assert!(auth_result.is_ok());
                     
                     let context = auth_result.unwrap();
@@ -195,23 +203,22 @@ proptest! {
                         prop_assert!(context.has_permission(permission));
                     }
                     
-                    // Property: User should not have permissions they weren't granted
+                    // Property: User should not have permissions unless one of the granted
+                    // permissions implies it (e.g. Write implies Read, Admin implies all).
                     for permission in &all_permissions {
-                        if !permissions.contains(permission) && permission != &Permission::Admin {
-                            // Admin permission implies all others, so skip this check for admin
-                            if !permissions.contains(&Permission::Admin) {
-                                prop_assert!(!context.has_permission(permission) || 
-                                           permissions.contains(permission));
-                            }
+                        let implied = permissions.iter().any(|p| p.implies(permission));
+                        if !implied {
+                            prop_assert!(!context.has_permission(permission));
                         }
                     }
                     
                     // Property: Authentication with wrong password should fail
-                    let wrong_auth = auth_manager.authenticate_user(username, "wrong_password");
+                    let wrong_auth = auth_manager.authenticate(username, "wrong_password");
                     prop_assert!(wrong_auth.is_err());
                 }
             }
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 
     #[test]
@@ -229,24 +236,20 @@ proptest! {
                 ..Default::default()
             };
 
-            let mut auth_manager = AuthManager::new(config).unwrap();
+            let mut auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
             let mut valid_sessions = Vec::new();
 
             // Create users and sessions
             for (username, password) in usernames.iter().zip(passwords.iter()) {
-                let create_result = auth_manager.create_user(
-                    username, 
-                    password, 
-                    vec![Permission::Read, Permission::Write]
-                );
+                let create_result = auth_manager.create_user(username.clone(), password, blockdb::auth::PermissionSet::from_permissions(vec![Permission::Read, Permission::Write]), None, 0);
                 
                 if create_result.is_ok() {
-                    let auth_result = auth_manager.authenticate_user(username, password);
+                    let auth_result = auth_manager.authenticate(username, password);
                     if let Ok(context) = auth_result {
                         valid_sessions.push(context.session_id.clone());
                         
                         // Property: Valid session should be validatable
-                        let validation = auth_manager.validate_session(&context.session_id);
+                        let validation = auth_manager.authenticate_with_token(&context.session_id);
                         prop_assert!(validation.is_ok());
                         
                         let validated_context = validation.unwrap();
@@ -259,7 +262,7 @@ proptest! {
             // Test session logout
             for session_id in &valid_sessions {
                 // Property: Session should be valid before logout
-                let pre_logout = auth_manager.validate_session(session_id);
+                let pre_logout = auth_manager.authenticate_with_token(session_id);
                 prop_assert!(pre_logout.is_ok());
                 
                 // Logout
@@ -267,10 +270,11 @@ proptest! {
                 prop_assert!(logout_result.is_ok());
                 
                 // Property: Session should be invalid after logout
-                let post_logout = auth_manager.validate_session(session_id);
+                let post_logout = auth_manager.authenticate_with_token(session_id);
                 prop_assert!(post_logout.is_err());
             }
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 }
 
@@ -327,7 +331,8 @@ proptest! {
             // Property: Blockchain integrity should be maintained after concurrent operations
             let integrity = db.verify_integrity().await.unwrap();
             prop_assert!(integrity);
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 
     #[test]
@@ -397,7 +402,8 @@ proptest! {
             // Property: Blockchain integrity should be maintained after flush
             let integrity = db.verify_integrity().await.unwrap();
             prop_assert!(integrity);
-        });
+            Ok::<(), proptest::prelude::TestCaseError>(())
+        })?;
     }
 }
 
@@ -494,15 +500,15 @@ mod deterministic_property_tests {
             ..Default::default()
         };
 
-        let mut auth_manager = AuthManager::new(config).unwrap();
+        let mut auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
 
         // Property: Admin permission should imply all other permissions
         auth_manager
-            .create_user("admin_user", "admin_pass", vec![Permission::Admin])
+            .create_user("admin_user".to_string(), "admin_pass", blockdb::auth::PermissionSet::admin(), None, 0)
             .unwrap();
 
         let context = auth_manager
-            .authenticate_user("admin_user", "admin_pass")
+            .authenticate("admin_user", "admin_pass")
             .unwrap();
 
         let all_permissions = vec![

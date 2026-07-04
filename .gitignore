@@ -2,7 +2,8 @@
 /target/
 debug/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed: this crate ships binaries (blockdb-server/blockdb-cli)
+# and the Dockerfile copies Cargo.lock for reproducible, cached builds.
 
 # IDE files
 .vscode/

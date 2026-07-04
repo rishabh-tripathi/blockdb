@@ -347,7 +347,7 @@ impl RaftNode {
         // Wait for commitment or timeout
         let timeout_duration = Duration::from_secs(5);
         match timeout(timeout_duration, rx).await {
-            Ok(Ok(())) => {
+            Ok(Ok(_)) => {
                 let response = ConsensusMessage::ClientResponse {
                     request_id,
                     success: true,
@@ -586,13 +586,17 @@ impl ConsensusEngine for RaftNode {
         state.leader_id.clone()
     }
     
-    async fn add_node(&self, node_id: NodeId, address: NodeAddress) -> Result<(), BlockDBError> {
+    async fn add_node(&self, _node_id: NodeId, _address: NodeAddress) -> Result<(), BlockDBError> {
         // TODO: Implement cluster membership changes
         Ok(())
     }
     
-    async fn remove_node(&self, node_id: &NodeId) -> Result<(), BlockDBError> {
+    async fn remove_node(&self, _node_id: &NodeId) -> Result<(), BlockDBError> {
         // TODO: Implement cluster membership changes
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

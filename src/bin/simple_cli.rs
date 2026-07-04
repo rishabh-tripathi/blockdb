@@ -1,4 +1,5 @@
 use blockdb::{BlockDBConfig, BlockDBHandle, AuthManager, Permission};
+use blockdb::auth::{AuthConfig, PermissionSet};
 use blockdb::storage::collection::{CollectionManager, IndexDefinition};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
@@ -138,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = BlockDBHandle::new(config.clone())?;
     let collection_manager = CollectionManager::new(config.clone())?;
-    let mut auth_manager = AuthManager::new(config.clone())?;
+    let mut auth_manager = AuthManager::new(AuthConfig::default());
 
     match args.command {
         Commands::Put { key, value, base64 } => {
@@ -610,12 +611,13 @@ async fn handle_auth_action(action: AuthAction, auth_manager: &mut AuthManager) 
             let perms: Result<Vec<Permission>, _> = permissions.iter()
                 .map(|p| p.parse())
                 .collect();
-            
+
             let perms = perms.map_err(|_| "Invalid permission format")?;
-            
-            match auth_manager.create_user(&username, &password, perms) {
-                Ok(user_id) => {
-                    println!("✅ User '{}' created successfully with ID: {}", username, user_id);
+            let permission_set = PermissionSet::from_permissions(perms);
+
+            match auth_manager.create_user(username.clone(), &password, permission_set, Some("admin".to_string()), 0) {
+                Ok(_keypair) => {
+                    println!("✅ User '{}' created successfully", username);
                 }
                 Err(e) => {
                     println!("❌ Failed to create user: {}", e);
@@ -623,7 +625,7 @@ async fn handle_auth_action(action: AuthAction, auth_manager: &mut AuthManager) 
             }
         }
         AuthAction::Login { username, password } => {
-            match auth_manager.authenticate_user(&username, &password) {
+            match auth_manager.authenticate(&username, &password) {
                 Ok(context) => {
                     println!("✅ Login successful!");
                     println!("   Session ID: {}", context.session_id);
@@ -646,25 +648,21 @@ async fn handle_auth_action(action: AuthAction, auth_manager: &mut AuthManager) 
             }
         }
         AuthAction::ListUsers => {
-            let users = auth_manager.list_users()?;
+            let users = auth_manager.list_users();
             if users.is_empty() {
                 println!("No users found.");
             } else {
                 println!("Users:");
                 for user in users {
-                    println!("  • {} ({})", user.username, user.user_id);
-                    println!("    Status: {:?}", user.status);
-                    println!("    Permissions: {:?}", user.permissions);
-                    println!("    Created: {}", user.created_at);
-                    println!();
+                    println!("  • {}", user);
                 }
             }
         }
         AuthAction::GrantPermission { username, permission } => {
             let perm: Permission = permission.parse()
                 .map_err(|_| "Invalid permission format")?;
-            
-            match auth_manager.grant_permission(&username, perm) {
+
+            match auth_manager.grant_permission(&username, perm, "admin", 0) {
                 Ok(_) => {
                     println!("✅ Permission '{}' granted to user '{}'", permission, username);
                 }
@@ -676,8 +674,8 @@ async fn handle_auth_action(action: AuthAction, auth_manager: &mut AuthManager) 
         AuthAction::RevokePermission { username, permission } => {
             let perm: Permission = permission.parse()
                 .map_err(|_| "Invalid permission format")?;
-            
-            match auth_manager.revoke_permission(&username, perm) {
+
+            match auth_manager.revoke_permission(&username, &perm, "admin", 0) {
                 Ok(_) => {
                     println!("✅ Permission '{}' revoked from user '{}'", permission, username);
                 }
@@ -686,15 +684,8 @@ async fn handle_auth_action(action: AuthAction, auth_manager: &mut AuthManager) 
                 }
             }
         }
-        AuthAction::ChangePassword { username, old_password, new_password } => {
-            match auth_manager.change_password(&username, &old_password, &new_password) {
-                Ok(_) => {
-                    println!("✅ Password changed successfully for user '{}'", username);
-                }
-                Err(e) => {
-                    println!("❌ Failed to change password: {}", e);
-                }
-            }
+        AuthAction::ChangePassword { username, .. } => {
+            println!("❌ Password change is not supported in this build for user '{}'", username);
         }
     }
     Ok(())
@@ -712,9 +703,10 @@ async fn handle_interactive_auth_command(parts: &[&str], auth_manager: &mut Auth
                 } else {
                     vec![Permission::Read] // Default permission
                 };
-                
-                match auth_manager.create_user(username, password, permissions) {
-                    Ok(user_id) => println!("✅ User '{}' created with ID: {}", username, user_id),
+                let permission_set = PermissionSet::from_permissions(permissions);
+
+                match auth_manager.create_user(username.to_string(), password, permission_set, Some("admin".to_string()), 0) {
+                    Ok(_keypair) => println!("✅ User '{}' created", username),
                     Err(e) => println!("❌ Error: {}", e),
                 }
             } else {
@@ -726,7 +718,7 @@ async fn handle_interactive_auth_command(parts: &[&str], auth_manager: &mut Auth
                 let username = parts[1];
                 let password = parts[2];
                 
-                match auth_manager.authenticate_user(username, password) {
+                match auth_manager.authenticate(username, password) {
                     Ok(context) => {
                         println!("✅ Login successful!");
                         println!("   Session: {}", context.session_id);
@@ -750,18 +742,14 @@ async fn handle_interactive_auth_command(parts: &[&str], auth_manager: &mut Auth
             }
         }
         "list-users" => {
-            match auth_manager.list_users() {
-                Ok(users) => {
-                    if users.is_empty() {
-                        println!("No users found.");
-                    } else {
-                        println!("Users:");
-                        for user in users {
-                            println!("  • {} ({})", user.username, user.user_id);
-                        }
-                    }
+            let users = auth_manager.list_users();
+            if users.is_empty() {
+                println!("No users found.");
+            } else {
+                println!("Users:");
+                for user in users {
+                    println!("  • {}", user);
                 }
-                Err(e) => println!("❌ Error: {}", e),
             }
         }
         "grant" => {
@@ -769,8 +757,8 @@ async fn handle_interactive_auth_command(parts: &[&str], auth_manager: &mut Auth
                 let username = parts[1];
                 let permission: Permission = parts[2].parse()
                     .map_err(|_| "Invalid permission format")?;
-                
-                match auth_manager.grant_permission(username, permission) {
+
+                match auth_manager.grant_permission(username, permission, "admin", 0) {
                     Ok(_) => println!("✅ Permission granted"),
                     Err(e) => println!("❌ Error: {}", e),
                 }
@@ -783,8 +771,8 @@ async fn handle_interactive_auth_command(parts: &[&str], auth_manager: &mut Auth
                 let username = parts[1];
                 let permission: Permission = parts[2].parse()
                     .map_err(|_| "Invalid permission format")?;
-                
-                match auth_manager.revoke_permission(username, permission) {
+
+                match auth_manager.revoke_permission(username, &permission, "admin", 0) {
                     Ok(_) => println!("✅ Permission revoked"),
                     Err(e) => println!("❌ Error: {}", e),
                 }

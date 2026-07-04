@@ -135,12 +135,14 @@ pub enum ConsensusMessage {
     },
 }
 
+#[async_trait::async_trait]
 pub trait ConsensusEngine: Send + Sync {
     async fn propose(&self, operation: crate::transaction::Operation) -> Result<(), crate::error::BlockDBError>;
     async fn is_leader(&self) -> bool;
     async fn get_leader(&self) -> Option<NodeId>;
     async fn add_node(&self, node_id: NodeId, address: NodeAddress) -> Result<(), crate::error::BlockDBError>;
     async fn remove_node(&self, node_id: &NodeId) -> Result<(), crate::error::BlockDBError>;
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[derive(Debug)]

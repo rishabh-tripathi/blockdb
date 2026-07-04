@@ -2,7 +2,7 @@
 [database]
 data_dir = "./blockdb_data"
 memtable_size_limit = 67108864  # 64MB
-wal_sync_interval = 1000        # milliseconds
+wal_sync_interval_ms = 1000     # milliseconds
 compaction_threshold = 4
 blockchain_batch_size = 1000
 

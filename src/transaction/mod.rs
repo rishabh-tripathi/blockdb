@@ -214,15 +214,15 @@ impl TransactionManager {
             .ok_or_else(|| BlockDBError::StorageError("Transaction not found".to_string()))?
             .clone();
         
-        let mut tx = tx_arc.lock();
-        tx.commit()?;
-        
-        // Log commit
         {
+            let mut tx = tx_arc.lock();
+            tx.commit()?;
+
+            // Log commit
             let mut log = self.transaction_log.lock();
             log.log_commit(tx_id)?;
-        }
-        
+        } // drop non-Send guards before awaiting
+
         // Release all locks
         self.lock_manager.release_all_locks(tx_id).await;
         
@@ -234,19 +234,19 @@ impl TransactionManager {
     
     pub async fn abort_transaction(&self, tx_id: &TransactionId) -> Result<(), BlockDBError> {
         if let Some((_, tx_arc)) = self.active_transactions.remove(tx_id) {
-            let mut tx = tx_arc.lock();
-            tx.abort();
-            
-            // Log abort
             {
+                let mut tx = tx_arc.lock();
+                tx.abort();
+
+                // Log abort
                 let mut log = self.transaction_log.lock();
                 log.log_abort(tx_id)?;
-            }
-            
+            } // drop non-Send guards before awaiting
+
             // Release all locks
             self.lock_manager.release_all_locks(tx_id).await;
         }
-        
+
         Ok(())
     }
     

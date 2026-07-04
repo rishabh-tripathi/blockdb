@@ -54,6 +54,9 @@ impl SSTable {
         file.write_all(&(index_data.len() as u64).to_be_bytes())?;
         
         file.flush()?;
+        // Durably persist the SSTable before the caller truncates the WAL that
+        // backs these records; otherwise a crash could lose already-"flushed" data.
+        file.sync_all()?;
         file.seek(SeekFrom::Start(0))?;
 
         Ok(SSTable {

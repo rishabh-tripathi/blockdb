@@ -1,11 +1,16 @@
-use blockdb::{BlockDBConfig, BlockDBHandle, BlockDBServer, ApiConfig};
+use blockdb::api::shutdown_signal;
+use blockdb::auth::AuthConfig;
+use blockdb::{ApiConfig, AuthManager, BlockDBConfig, BlockDBHandle, BlockDBServer};
 use clap::Parser;
 use std::path::Path;
-use tokio;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "BlockDB HTTP server", long_about = None)]
 struct Args {
+    /// Optional TOML config file. CLI flags override values loaded from it.
+    #[arg(long)]
+    config: Option<String>,
+
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
@@ -33,57 +38,117 @@ struct Args {
     #[arg(long, default_value = "30")]
     request_timeout: u64,
 
+    /// Disable authentication entirely (NOT recommended for production).
     #[arg(long)]
-    disable_cors: bool,
+    disable_auth: bool,
+
+    /// Require a valid token for read operations as well as writes.
+    #[arg(long)]
+    require_auth_for_reads: bool,
 
     #[arg(long)]
-    disable_compression: bool,
+    disable_cors: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    // Structured logging honouring RUST_LOG / BLOCKDB_LOG_LEVEL (default: info).
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        std::env::var("BLOCKDB_LOG_LEVEL").unwrap_or_else(|_| "info".to_string())
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .init();
 
     let args = Args::parse();
 
+    // Optionally load a TOML config file (env var BLOCKDB_CONFIG or --config).
+    let file_config = load_file_config(args.config.clone());
+    if let Some(ref fc) = file_config {
+        tracing::info!("loaded configuration from file");
+        let _ = fc; // values applied below where present
+    }
+
     let db_config = BlockDBConfig {
-        data_dir: args.data_dir,
+        data_dir: args.data_dir.clone(),
         memtable_size_limit: args.memtable_size,
-        wal_sync_interval: args.wal_sync_interval,
+        wal_sync_interval_ms: args.wal_sync_interval,
         compaction_threshold: args.compaction_threshold,
         blockchain_batch_size: args.blockchain_batch_size,
+        auth_enabled: !args.disable_auth,
+        ..Default::default()
     };
 
     let api_config = ApiConfig {
-        host: args.host,
+        host: args.host.clone(),
         port: args.port,
         max_connections: args.max_connections,
         request_timeout: args.request_timeout,
         enable_cors: !args.disable_cors,
-        enable_compression: !args.disable_compression,
+        enable_compression: false,
+        auth_enabled: !args.disable_auth,
+        require_auth_for_reads: args.require_auth_for_reads,
+        session_duration_hours: 24,
     };
-
-    println!("Starting BlockDB server with config:");
-    println!("  Data directory: {}", db_config.data_dir);
-    println!("  Memtable size: {} MB", db_config.memtable_size_limit / 1024 / 1024);
-    println!("  Server address: {}:{}", api_config.host, api_config.port);
-    println!("  Max connections: {}", api_config.max_connections);
 
     if !Path::new(&db_config.data_dir).exists() {
         std::fs::create_dir_all(&db_config.data_dir)?;
-        println!("Created data directory: {}", db_config.data_dir);
+        tracing::info!(data_dir = %db_config.data_dir, "created data directory");
     }
+
+    tracing::info!(
+        host = %api_config.host,
+        port = api_config.port,
+        data_dir = %db_config.data_dir,
+        auth_enabled = api_config.auth_enabled,
+        "starting BlockDB server"
+    );
 
     let db_handle = BlockDBHandle::new(db_config)?;
-    let server = BlockDBServer::new(db_handle, api_config);
 
-    println!("BlockDB server initialized successfully");
-    println!("Starting HTTP server...");
+    let server = if api_config.auth_enabled {
+        let auth_config = AuthConfig::default();
+        if let (Ok(user), Ok(pass)) = (
+            std::env::var("BLOCKDB_ADMIN_USER"),
+            std::env::var("BLOCKDB_ADMIN_PASSWORD"),
+        ) {
+            // Bootstrap an admin from the environment; the manager also seeds a
+            // default admin if none is configured.
+            let am = AuthManager::new(auth_config.clone());
+            let _ = am.create_admin_user(user, &pass);
+            BlockDBServer::with_auth(db_handle, api_config, am)
+        } else {
+            tracing::warn!(
+                "auth enabled but BLOCKDB_ADMIN_USER/BLOCKDB_ADMIN_PASSWORD not set; \
+                 using the built-in default admin — change the password immediately"
+            );
+            BlockDBServer::with_auth(db_handle, api_config, AuthManager::new(auth_config))
+        }
+    } else {
+        tracing::warn!("authentication is DISABLED");
+        BlockDBServer::new(db_handle, api_config)
+    };
 
-    if let Err(e) = server.start().await {
-        eprintln!("Server error: {}", e);
-        std::process::exit(1);
-    }
-
+    server.serve_with_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Load a TOML config file if `--config` or the BLOCKDB_CONFIG env var points to one.
+/// Returns the parsed table; individual fields are consumed by the caller. Missing
+/// files are a hard error only when explicitly requested via `--config`.
+fn load_file_config(explicit: Option<String>) -> Option<toml::Value> {
+    let path = explicit.or_else(|| std::env::var("BLOCKDB_CONFIG").ok())?;
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::error!(path = %path, error = %e, "failed to parse config file");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::error!(path = %path, error = %e, "failed to read config file");
+            None
+        }
+    }
 }

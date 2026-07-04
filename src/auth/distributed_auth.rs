@@ -96,6 +96,7 @@ impl AuthenticatedDistributedBlockDB {
                 wal_sync_interval_ms: config.wal_sync_interval_ms,
                 compaction_threshold: config.compaction_threshold,
                 blockchain_batch_size: config.blockchain_batch_size,
+                ..Default::default()
             },
             cluster_config: crate::consensus::ClusterConfig {
                 node_id,
@@ -146,7 +147,7 @@ impl AuthenticatedDistributedBlockDB {
 
     pub async fn authenticate_with_token(&self, session_id: &str) -> Result<AuthContext, BlockDBError> {
         if let Some(auth_manager) = &self.auth_manager {
-            auth_manager.authenticate_with_token(session_id).map_err(BlockDBError::AuthError)
+            auth_manager.authenticate_with_token(&session_id.to_string()).map_err(BlockDBError::AuthError)
         } else {
             Err(BlockDBError::AuthError(AuthError::CryptographicError(
                 "Authentication is not enabled".to_string(),
@@ -156,7 +157,7 @@ impl AuthenticatedDistributedBlockDB {
 
     pub async fn logout(&self, session_id: &str) -> Result<(), BlockDBError> {
         if let Some(auth_manager) = &self.auth_manager {
-            auth_manager.logout(session_id).map_err(BlockDBError::AuthError)
+            auth_manager.logout(&session_id.to_string()).map_err(BlockDBError::AuthError)
         } else {
             Ok(())
         }

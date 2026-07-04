@@ -5,6 +5,7 @@ pub mod consensus;
 pub mod transaction;
 pub mod distributed;
 pub mod auth;
+pub mod consent;
 
 pub use storage::{BlockDB, BlockDBConfig, Record};
 pub use api::{BlockDBServer, ApiConfig};
@@ -13,6 +14,7 @@ pub use distributed::{DistributedBlockDB, DistributedBlockDBConfig};
 pub use transaction::{TransactionManager, TransactionId, Operation};
 pub use consensus::{NodeId, NodeAddress, ClusterConfig};
 pub use auth::{AuthManager, AuthContext, AuthError, Permission, PermissionSet, CryptoIdentity, AuthenticatedDistributedBlockDB};
+pub use consent::{ConsentStore, ConsentEvent, ConsentState, ConsentStatus};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,7 +33,10 @@ impl BlockDBHandle {
     }
 
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), BlockDBError> {
-        let db = self.db.read().await;
+        // Take the write lock so the append-only existence check and the insert
+        // happen atomically; a read lock would let two concurrent puts of the same
+        // key both pass the "does not exist" check and violate the invariant.
+        let db = self.db.write().await;
         db.put(key, value)?;
         Ok(())
     }
@@ -39,6 +44,11 @@ impl BlockDBHandle {
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BlockDBError> {
         let db = self.db.read().await;
         db.get(key).map_err(BlockDBError::from)
+    }
+
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BlockDBError> {
+        let db = self.db.read().await;
+        db.scan_prefix(prefix).map_err(BlockDBError::from)
     }
 
     pub async fn verify_integrity(&self) -> Result<bool, BlockDBError> {

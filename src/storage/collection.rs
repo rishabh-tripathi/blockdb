@@ -757,6 +757,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let collection = Collection::new(metadata, config).unwrap();
@@ -783,6 +784,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let collection = Collection::new(metadata, config).unwrap();
@@ -801,15 +803,20 @@ mod tests {
         collection.put(b"user1", b"{'email': 'alice@example.com'}").unwrap();
         collection.put(b"user2", b"{'email': 'bob@example.com'}").unwrap();
         
-        // Verify index exists
-        let indexes = collection.indexes.read().unwrap();
-        assert!(indexes.contains_key("email_index"));
-        
+        // Verify index exists (scope the read guard so it is released before drop_index,
+        // which needs a write lock — holding it here would self-deadlock).
+        {
+            let indexes = collection.indexes.read().unwrap();
+            assert!(indexes.contains_key("email_index"));
+        }
+
         // Drop index
         collection.drop_index("email_index").unwrap();
-        
-        let indexes = collection.indexes.read().unwrap();
-        assert!(!indexes.contains_key("email_index"));
+
+        {
+            let indexes = collection.indexes.read().unwrap();
+            assert!(!indexes.contains_key("email_index"));
+        }
     }
 
     #[test]
@@ -856,6 +863,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let manager = CollectionManager::new(config).unwrap();
@@ -880,6 +888,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let manager = CollectionManager::new(config).unwrap();
@@ -954,6 +963,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let manager = CollectionManager::new(config).unwrap();
@@ -993,6 +1003,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let manager = CollectionManager::new(config).unwrap();
@@ -1029,6 +1040,7 @@ mod tests {
             wal_sync_interval_ms: 1000,
             compaction_threshold: 4,
             blockchain_batch_size: 100,
+            ..Default::default()
         };
 
         let manager = CollectionManager::new(config).unwrap();

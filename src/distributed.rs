@@ -314,7 +314,7 @@ impl DistributedBlockDB {
     
     pub async fn verify_integrity(&self) -> Result<bool, BlockDBError> {
         let storage = self.storage.read();
-        storage.verify_integrity()
+        storage.verify_integrity().map_err(BlockDBError::from)
     }
     
     pub async fn force_sync(&self) -> Result<(), BlockDBError> {
@@ -376,7 +376,7 @@ impl DistributedBlockDB {
                     .as_millis() as u64;
                 
                 // Remove entries older than 5 seconds
-                read_cache.retain(|_, (_, timestamp)| current_time - timestamp < 5000);
+                read_cache.retain(|_, (_, timestamp)| current_time.saturating_sub(*timestamp) < 5000);
             }
         });
         
@@ -429,21 +429,6 @@ impl TransactionContext {
         db.execute_in_transaction(&self.tx_id, operation).await
     }
 }
-
-// Extension trait to add any() method to ConsensusEngine
-trait AnyTrait: std::any::Any {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-impl<T: std::any::Any> AnyTrait for T {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-// Extend ConsensusEngine with Any
-pub trait ConsensusEngineExt: ConsensusEngine + AnyTrait {}
-impl<T: ConsensusEngine + AnyTrait> ConsensusEngineExt for T {}
 
 #[cfg(test)]
 mod tests {

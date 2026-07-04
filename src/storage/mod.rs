@@ -63,12 +63,34 @@ pub struct BlockDB {
     sequence_counter: Arc<Mutex<u64>>,
 }
 
+impl std::fmt::Debug for BlockDB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockDB")
+            .field("data_dir", &self.config.data_dir)
+            .field("sequence_counter", &*self.sequence_counter.lock().unwrap())
+            .finish()
+    }
+}
+
 impl BlockDB {
     pub fn new(config: BlockDBConfig) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&config.data_dir)?;
-        
+
+        // Durability model driven by wal_sync_interval_ms:
+        //   0  -> fsync on every append (strongest; acknowledged writes survive power loss)
+        //   >0 -> flush to the OS on every append and fsync at memtable-flush boundaries
+        //         (higher throughput; a crash may lose the most recent un-flushed writes).
+        let sync_mode = if config.wal_sync_interval_ms == 0 {
+            wal::SyncMode::Always
+        } else {
+            wal::SyncMode::Periodic
+        };
+
         let memtable = Arc::new(RwLock::new(memtable::MemTable::new()));
-        let wal = Arc::new(Mutex::new(wal::WriteAheadLog::new(&config.data_dir)?));
+        let wal = Arc::new(Mutex::new(wal::WriteAheadLog::with_sync_mode(
+            &config.data_dir,
+            sync_mode,
+        )?));
         let sstables = Arc::new(RwLock::new(Vec::new()));
         let blockchain = Arc::new(Mutex::new(blockchain::BlockChain::new(&config.data_dir)?));
         let sequence_counter = Arc::new(Mutex::new(0));
@@ -81,31 +103,72 @@ impl BlockDB {
             blockchain,
             sequence_counter,
         };
-        
-        // Recover from WAL on startup
+
+        // Load previously-flushed SSTables from disk, then replay the WAL for the
+        // records that had not yet been flushed at shutdown/crash time.
+        db.load_sstables()?;
         db.recover_from_wal()?;
-        
+
         Ok(db)
     }
-    
+
+    /// Discover and open the SSTable files already present in the data directory.
+    /// Files are named with a monotonically increasing nanosecond timestamp, so a
+    /// lexical sort by filename restores their original write order (oldest first).
+    fn load_sstables(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut sstable_files: Vec<std::path::PathBuf> = std::fs::read_dir(&self.config.data_dir)?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("sst"))
+            .collect();
+        sstable_files.sort();
+
+        let mut sstables = self.sstables.write().unwrap();
+        let mut max_sequence = 0u64;
+        for path in sstable_files {
+            let path_str = path.to_string_lossy().to_string();
+            match sstable::SSTable::open(&path_str) {
+                Ok(mut table) => {
+                    // Track the highest sequence number so new writes continue the sequence.
+                    let keys: Vec<Vec<u8>> = table.iter().cloned().collect();
+                    for key in keys {
+                        if let Ok(Some(record)) = table.get(&key) {
+                            max_sequence = max_sequence.max(record.sequence_number);
+                        }
+                    }
+                    sstables.push(table);
+                }
+                Err(e) => {
+                    eprintln!("Warning: skipping unreadable SSTable {}: {}", path_str, e);
+                }
+            }
+        }
+
+        if max_sequence > 0 {
+            let mut counter = self.sequence_counter.lock().unwrap();
+            *counter = (*counter).max(max_sequence);
+        }
+
+        Ok(())
+    }
+
     fn recover_from_wal(&self) -> Result<(), Box<dyn std::error::Error>> {
         let wal = self.wal.lock().unwrap();
         let records = wal.recover()?;
-        
+
         if !records.is_empty() {
             let mut memtable = self.memtable.write().unwrap();
             let mut max_sequence = 0u64;
-            
+
             for record in records {
                 max_sequence = max_sequence.max(record.sequence_number);
                 memtable.insert(record);
             }
-            
+
             // Update sequence counter
             let mut counter = self.sequence_counter.lock().unwrap();
-            *counter = max_sequence;
+            *counter = (*counter).max(max_sequence);
         }
-        
+
         Ok(())
     }
 
@@ -166,24 +229,27 @@ impl BlockDB {
             hash,
         };
 
+        // 1. Record the write intent in the WAL first (write-ahead durability).
         {
             let mut wal = self.wal.lock().unwrap();
             wal.append(&record)?;
         }
 
-        {
-            let mut memtable = self.memtable.write().unwrap();
-            memtable.insert(record.clone());
-            
-            if memtable.size() > self.config.memtable_size_limit {
-                drop(memtable);
-                self.flush_memtable()?;
-            }
-        }
-
+        // 2. Add to the blockchain's pending set *before* any flush so that if the
+        //    memtable flush seals a block, this record is included in the audit trail.
         {
             let mut blockchain = self.blockchain.lock().unwrap();
-            blockchain.add_record(record)?;
+            blockchain.add_record(record.clone())?;
+        }
+
+        // 3. Insert into the memtable and flush if it has grown past the limit.
+        let needs_flush = {
+            let mut memtable = self.memtable.write().unwrap();
+            memtable.insert(record);
+            memtable.size() > self.config.memtable_size_limit
+        };
+        if needs_flush {
+            self.flush_memtable()?;
         }
 
         Ok(())
@@ -209,6 +275,42 @@ impl BlockDB {
         Ok(None)
     }
 
+    /// Return every key/value pair whose key starts with `prefix`, gathered across
+    /// the memtable and all SSTables, sorted ascending by key. Used by higher layers
+    /// (e.g. the consent event log) that need range scans over an append-only keyspace.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        // SSTables first (oldest to newest) so newer data overrides on key collisions.
+        {
+            let mut sstables = self.sstables.write().unwrap();
+            for sstable in sstables.iter_mut() {
+                let keys: Vec<Vec<u8>> = sstable
+                    .iter()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned()
+                    .collect();
+                for key in keys {
+                    if let Some(record) = sstable.get(&key)? {
+                        merged.insert(key, record.value);
+                    }
+                }
+            }
+        }
+
+        // Memtable last so the freshest values win.
+        {
+            let memtable = self.memtable.read().unwrap();
+            for (key, record) in memtable.iter() {
+                if key.starts_with(prefix) {
+                    merged.insert(key.clone(), record.value.clone());
+                }
+            }
+        }
+
+        Ok(merged.into_iter().collect())
+    }
+
     fn flush_memtable(&self) -> Result<(), Box<dyn std::error::Error>> {
         let memtable = {
             let mut memtable_guard = self.memtable.write().unwrap();
@@ -216,16 +318,96 @@ impl BlockDB {
             old_memtable
         };
 
-        let sstable_path = format!("{}/sstable_{}.sst", 
-            self.config.data_dir, 
+        if memtable.is_empty() {
+            return Ok(());
+        }
+
+        let sstable_path = format!("{}/sstable_{}.sst",
+            self.config.data_dir,
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         );
 
+        // 1. Write and fsync the SSTable so the flushed records are durable on disk.
         let sstable = sstable::SSTable::create_from_memtable(&sstable_path, &memtable)?;
-        
+
         {
             let mut sstables = self.sstables.write().unwrap();
             sstables.push(sstable);
+        }
+
+        // 2. Seal any pending blockchain records so the immutable audit trail is
+        //    persisted before we drop the WAL that currently backs them.
+        {
+            let mut blockchain = self.blockchain.lock().unwrap();
+            blockchain.force_create_block()?;
+        }
+
+        // 3. The records are now durable in both the SSTable and the blockchain, so
+        //    the WAL that protected them can be truncated to keep it bounded.
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.truncate()?;
+        }
+
+        // 4. Merge SSTables once we exceed the configured threshold.
+        self.maybe_compact()?;
+
+        Ok(())
+    }
+
+    /// Size-tiered compaction: when the number of on-disk SSTables exceeds the
+    /// configured threshold, merge them all into a single compacted SSTable and
+    /// delete the sources. BlockDB is append-only, so a merge is a straight union
+    /// of keys with no conflict resolution required.
+    fn maybe_compact(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let should_compact = {
+            let sstables = self.sstables.read().unwrap();
+            sstables.len() > self.config.compaction_threshold
+        };
+        if !should_compact {
+            return Ok(());
+        }
+
+        // Collect every record across all current SSTables (dedup by key via BTreeMap).
+        let (merged, old_paths): (BTreeMap<Vec<u8>, Record>, Vec<String>) = {
+            let mut sstables = self.sstables.write().unwrap();
+            let mut merged = BTreeMap::new();
+            let mut old_paths = Vec::new();
+            for table in sstables.iter_mut() {
+                let keys: Vec<Vec<u8>> = table.iter().cloned().collect();
+                for key in keys {
+                    if let Some(record) = table.get(&key)? {
+                        merged.insert(key, record);
+                    }
+                }
+                old_paths.push(table.path().to_string());
+            }
+            (merged, old_paths)
+        };
+
+        if merged.is_empty() {
+            return Ok(());
+        }
+
+        // Materialize the merged records into a temporary memtable and write one SSTable.
+        let mut merged_memtable = memtable::MemTable::new();
+        for (_key, record) in merged {
+            merged_memtable.insert(record);
+        }
+        let compacted_path = format!("{}/compacted_{}.sst",
+            self.config.data_dir,
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let compacted = sstable::SSTable::create_from_memtable(&compacted_path, &merged_memtable)?;
+
+        // Swap the live set to just the compacted table, then remove the old files.
+        {
+            let mut sstables = self.sstables.write().unwrap();
+            sstables.clear();
+            sstables.push(compacted);
+        }
+        for path in old_paths {
+            let _ = std::fs::remove_file(path);
         }
 
         Ok(())

@@ -1,6 +1,6 @@
 # Multi-stage Docker build for BlockDB
 # Stage 1: Build environment
-FROM rust:1.82-slim as builder
+FROM rust:1.94-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

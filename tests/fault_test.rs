@@ -55,6 +55,17 @@ fn start_one(
     peers: &[(String, String, u16)],
     data_dir: &Path,
 ) -> RunningNode {
+    start_one_timed(id, port, peers, data_dir, 50, 150)
+}
+
+fn start_one_timed(
+    id: &str,
+    port: u16,
+    peers: &[(String, String, u16)],
+    data_dir: &Path,
+    heartbeat_ms: u64,
+    election_ms: u64,
+) -> RunningNode {
     let storage_config = BlockDBConfig {
         data_dir: data_dir.to_string_lossy().to_string(),
         ..Default::default()
@@ -64,8 +75,8 @@ fn start_one(
         "127.0.0.1",
         port,
         peers,
-        Duration::from_millis(50),
-        Duration::from_millis(150),
+        Duration::from_millis(heartbeat_ms),
+        Duration::from_millis(election_ms),
     );
     let node = ClusterNode::new(cluster_config, storage_config).unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -241,6 +252,97 @@ async fn test_follower_rejoins_and_catches_up() {
         "rejoined follower never caught up on the missed write"
     );
     nodes[follower] = Some(rejoined);
+
+    for slot in nodes.into_iter().flatten() {
+        slot.crash().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_add_node_to_live_cluster() {
+    // Start a 3-node cluster {0,1,2}.
+    let size = 3;
+    let base = NEXT_PORT.fetch_add(4, Ordering::SeqCst);
+    let joiner_port = base + 3;
+    let core_peers = peer_list(size, base);
+    let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+
+    let mut nodes: Vec<Option<RunningNode>> = (0..size)
+        .map(|i| Some(start_one(&format!("node{}", i), base + i as u16, &core_peers, dirs[i].path())))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let leader = wait_any_leader(&nodes).await.expect("no initial leader");
+    let leader_node = nodes[leader].as_ref().unwrap().node.clone();
+
+    // Commit a write while the cluster is still 3 nodes (fast majority of 2).
+    leader_node.put(b"joined", b"welcome").await.unwrap();
+
+    // Start the joiner (node3). It knows the others; give it a long election timeout
+    // so it stays a quiet follower and doesn't disrupt before being admitted.
+    let joiner_peers: Vec<(String, String, u16)> = (0..4)
+        .map(|i| (format!("node{}", i), "127.0.0.1".to_string(), base + i as u16))
+        .collect();
+    let joiner = start_one_timed("node3", joiner_port, &joiner_peers, dirs[3].path(), 50, 3000);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The leader admits node3 into the cluster; it must catch up on the committed log.
+    leader_node.add_node("node3", "127.0.0.1", joiner_port).await.unwrap();
+    assert!(
+        wait_for_value(&joiner.node, b"joined", b"welcome").await,
+        "newly added node never caught up on the replicated log"
+    );
+
+    joiner.crash().await;
+    for slot in nodes.drain(..).flatten() {
+        slot.crash().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_remove_node_from_live_cluster() {
+    // 3-node cluster; the node we will remove gets a long election timeout so it
+    // can't disrupt the cluster in the window before it is decommissioned.
+    let size = 3;
+    let base = NEXT_PORT.fetch_add(size as u16, Ordering::SeqCst);
+    let peers = peer_list(size, base);
+    let dirs: Vec<TempDir> = (0..size).map(|_| TempDir::new().unwrap()).collect();
+
+    // Make node2 the removable one with a long election timeout.
+    let mut nodes: Vec<Option<RunningNode>> = Vec::new();
+    for i in 0..size {
+        let election = if i == 2 { 3000 } else { 150 };
+        nodes.push(Some(start_one_timed(
+            &format!("node{}", i),
+            base + i as u16,
+            &peers,
+            dirs[i].path(),
+            50,
+            election,
+        )));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Ensure node0 or node1 leads (node2 can't, its timeout is long). Find the leader.
+    let leader = wait_any_leader(&nodes).await.expect("no initial leader");
+    assert_ne!(leader, 2, "the long-timeout node should not be leader");
+
+    // Remove node2 from the cluster.
+    let leader_node = nodes[leader].as_ref().unwrap().node.clone();
+    leader_node.remove_node("node2").await.unwrap();
+
+    // Decommission the removed node, then confirm the remaining two still commit
+    // writes (majority is now 2 of 2).
+    nodes[2].take().unwrap().crash().await;
+
+    leader_node.put(b"after", b"removal").await.unwrap();
+    for slot in nodes.iter() {
+        if let Some(rn) = slot {
+            assert!(
+                wait_for_value(&rn.node, b"after", b"removal").await,
+                "remaining node did not get the post-removal write"
+            );
+        }
+    }
 
     for slot in nodes.into_iter().flatten() {
         slot.crash().await;

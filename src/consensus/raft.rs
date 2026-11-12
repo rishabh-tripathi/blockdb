@@ -19,6 +19,10 @@ use crate::transaction::Operation;
 
 pub struct RaftNode {
     config: ClusterConfig,
+    /// Active cluster membership (peer id -> address). Starts from `config.peers` and
+    /// is mutated by committed AddNode/RemoveNode config entries, so the cluster can
+    /// grow and shrink at runtime. All quorum math reads this, not `config.peers`.
+    active_peers: Arc<RwLock<HashMap<NodeId, NodeAddress>>>,
     state: Arc<RwLock<ConsensusState>>,
     log: Arc<RwLock<ReplicatedLog>>,
     next_index: Arc<RwLock<HashMap<NodeId, u64>>>,
@@ -47,8 +51,10 @@ impl RaftNode {
     ) -> Self {
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
 
+        let active_peers = config.peers.clone();
         RaftNode {
             config,
+            active_peers: Arc::new(RwLock::new(active_peers)),
             state: Arc::new(RwLock::new(ConsensusState::new())),
             log: Arc::new(RwLock::new(ReplicatedLog::new())),
             next_index: Arc::new(RwLock::new(HashMap::new())),
@@ -84,9 +90,14 @@ impl RaftNode {
         consensus_state.current_term = Term(hard.current_term);
         consensus_state.voted_for = hard.voted_for.clone().map(NodeId::from_string);
 
+        // Rebuild the effective membership by folding AddNode/RemoveNode entries from
+        // the recovered log onto the initial configured peer set.
+        let active_peers = Self::fold_membership(config.peers.clone(), &entries);
+
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
         Ok(RaftNode {
             config,
+            active_peers: Arc::new(RwLock::new(active_peers)),
             state: Arc::new(RwLock::new(consensus_state)),
             log: Arc::new(RwLock::new(ReplicatedLog::with_store(log_store, entries))),
             next_index: Arc::new(RwLock::new(HashMap::new())),
@@ -121,6 +132,146 @@ impl RaftNode {
         }
     }
 
+    /// Fold membership-change entries over an initial peer set to get the effective
+    /// membership (used on restart to rebuild from the persisted log).
+    fn fold_membership(
+        mut peers: HashMap<NodeId, NodeAddress>,
+        entries: &[LogEntry],
+    ) -> HashMap<NodeId, NodeAddress> {
+        for entry in entries {
+            match &entry.operation {
+                LogOperation::AddNode { node_id, address } => {
+                    peers.insert(node_id.clone(), address.clone());
+                }
+                LogOperation::RemoveNode { node_id } => {
+                    peers.remove(node_id);
+                }
+                _ => {}
+            }
+        }
+        peers
+    }
+
+    /// Snapshot of the current peer set (excludes self).
+    async fn peers_snapshot(&self) -> HashMap<NodeId, NodeAddress> {
+        self.active_peers.read().await.clone()
+    }
+
+    /// Current cluster size (peers + self) and the majority needed for a quorum.
+    async fn cluster_majority(&self) -> usize {
+        let size = self.active_peers.read().await.len() + 1;
+        (size / 2) + 1
+    }
+
+    /// Apply a membership change to the live peer set and replication bookkeeping.
+    /// Called as the config entry is appended (apply-on-append) on every node, so the
+    /// new configuration governs quorum decisions immediately.
+    async fn apply_membership_change(&self, op: &LogOperation) {
+        match op {
+            LogOperation::AddNode { node_id, address } => {
+                if *node_id == self.config.node_id {
+                    return; // never list ourselves as a peer
+                }
+                self.active_peers
+                    .write()
+                    .await
+                    .insert(node_id.clone(), address.clone());
+                let last_log_index = self.log.read().await.last_log_index();
+                self.next_index
+                    .write()
+                    .await
+                    .entry(node_id.clone())
+                    .or_insert(last_log_index + 1);
+                self.match_index
+                    .write()
+                    .await
+                    .entry(node_id.clone())
+                    .or_insert(0);
+                tracing::info!(node = %node_id.0, "membership: added node");
+            }
+            LogOperation::RemoveNode { node_id } => {
+                self.active_peers.write().await.remove(node_id);
+                self.next_index.write().await.remove(node_id);
+                self.match_index.write().await.remove(node_id);
+                tracing::info!(node = %node_id.0, "membership: removed node");
+            }
+            _ => {}
+        }
+    }
+
+    /// True if there is a membership-change entry in the log that is not yet committed
+    /// (Raft requires at most one membership change in flight at a time).
+    async fn membership_change_pending(&self) -> bool {
+        let log = self.log.read().await;
+        let commit = log.get_commit_index();
+        let last = log.last_log_index();
+        for idx in (commit + 1)..=last {
+            if let Some(entry) = log.get_entry(idx) {
+                if matches!(
+                    entry.operation,
+                    LogOperation::AddNode { .. } | LogOperation::RemoveNode { .. }
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Append a membership-change entry on the leader, apply it immediately
+    /// (apply-on-append), replicate, and wait for it to commit.
+    async fn propose_membership_change(&self, op: LogOperation) -> Result<(), BlockDBError> {
+        {
+            let state = self.state.read().await;
+            if !matches!(state.state, RaftState::Leader) {
+                return Err(BlockDBError::ConsensusError("not the leader".to_string()));
+            }
+        }
+        if self.membership_change_pending().await {
+            return Err(BlockDBError::ConsensusError(
+                "a membership change is already in progress".to_string(),
+            ));
+        }
+
+        let request_id = Uuid::new_v4();
+        {
+            let mut log = self.log.write().await;
+            let state = self.state.read().await;
+            let entry = LogEntry::new(
+                log.last_log_index() + 1,
+                state.current_term.clone(),
+                op.clone(),
+                request_id,
+            );
+            drop(state);
+            log.append(entry)?;
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut client_requests = self.client_requests.lock().await;
+            client_requests.insert(request_id, tx);
+        }
+
+        // The change commits under the CURRENT configuration (apply-on-commit): a
+        // 1->2 add commits with the old majority of 1, so it can't deadlock waiting
+        // for the not-yet-present node. apply_committed() adopts the new membership
+        // once the entry commits, after which the leader starts replicating to it.
+        self.replicate_to_followers().await;
+        self.update_commit_index().await;
+
+        let timeout_duration = self.config.election_timeout * 10;
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => {
+                self.client_requests.lock().await.remove(&request_id);
+                Err(BlockDBError::ConsensusError(
+                    "timed out committing membership change".to_string(),
+                ))
+            }
+        }
+    }
+
     /// A handle for injecting messages received over the network into this node's
     /// processing queue (used by the cluster server's `/raft/message` endpoint).
     pub fn message_injector(&self) -> mpsc::UnboundedSender<(NodeId, ConsensusMessage)> {
@@ -141,8 +292,9 @@ impl RaftNode {
             let mut match_index = self.match_index.write().await;
             let log = self.log.read().await;
             let last_log_index = log.last_log_index();
-            
-            for peer_id in self.config.peers.keys() {
+            let peers = self.active_peers.read().await;
+
+            for peer_id in peers.keys() {
                 next_index.insert(peer_id.clone(), last_log_index + 1);
                 match_index.insert(peer_id.clone(), 0);
             }
@@ -316,7 +468,7 @@ impl RaftNode {
                 votes.len()
             };
 
-            if votes_received >= self.config.majority() {
+            if votes_received >= self.cluster_majority().await {
                 // Won the election: become leader for this term.
                 state.become_leader(self.config.node_id.clone());
                 drop(state);
@@ -332,7 +484,7 @@ impl RaftNode {
     async fn handle_append_entries(&self, sender: NodeId, term: Term, leader_id: NodeId, prev_log_index: u64, prev_log_term: Term, entries: Vec<LogEntry>, leader_commit: u64) {
         let mut state = self.state.write().await;
         let mut log = self.log.write().await;
-        
+
         let mut success = false;
         let mut dirty = false;
 
@@ -390,13 +542,14 @@ impl RaftNode {
 
         // If the leader advanced our commit index, apply the newly-committed entries
         // to our local state machine so this follower stays consistent with the leader.
+        // Membership changes are adopted inside apply_committed (apply-on-commit).
         if success {
             self.apply_committed().await;
         }
 
         self.send_message(sender, response).await;
     }
-    
+
     async fn handle_append_entries_response(&self, sender: NodeId, term: Term, success: bool, match_index: u64) {
         let mut state = self.state.write().await;
         
@@ -587,7 +740,7 @@ impl RaftNode {
         let self_id = self.config.node_id.0.clone();
 
         // A single-node cluster wins its own election immediately.
-        if self.config.majority() <= 1 {
+        if self.cluster_majority().await <= 1 {
             state.become_leader(self.config.node_id.clone());
             drop(state);
             drop(log);
@@ -612,11 +765,11 @@ impl RaftNode {
         self.persist_hard_state(persist_term, Some(self_id)).await;
 
         // Send vote requests to all peers
-        for peer_id in self.config.peers.keys() {
+        for peer_id in self.peers_snapshot().await.keys() {
             self.send_message(peer_id.clone(), request.clone()).await;
         }
     }
-    
+
     async fn send_heartbeats(&self) {
         self.replicate_to_followers().await;
     }
@@ -661,27 +814,36 @@ impl RaftNode {
     }
     
     async fn initialize_leader_state(&self) {
+        // Snapshot peers first (separate lock) to avoid holding index locks across it.
+        let peers: Vec<NodeId> = self.active_peers.read().await.keys().cloned().collect();
         let mut next_index = self.next_index.write().await;
         let mut match_index = self.match_index.write().await;
         let log = self.log.read().await;
-        
+
         let last_log_index = log.last_log_index();
-        
-        for peer_id in self.config.peers.keys() {
+
+        next_index.clear();
+        match_index.clear();
+        for peer_id in peers {
             next_index.insert(peer_id.clone(), last_log_index + 1);
             match_index.insert(peer_id.clone(), 0);
         }
     }
-    
+
     async fn update_commit_index(&self) {
+        // Compute the quorum threshold up front, before taking the index/log/state
+        // locks, so we never await on the peer-set lock while holding them (which
+        // could deadlock against an in-flight membership change).
+        let majority = self.cluster_majority().await;
+
         let log = self.log.read().await;
         let match_index = self.match_index.read().await;
         let state = self.state.read().await;
-        
+
         if !matches!(state.state, RaftState::Leader) {
             return;
         }
-        
+
         let current_commit = log.get_commit_index();
         let last_log_index = log.last_log_index();
         let mut highest_committable: Option<u64> = None;
@@ -689,14 +851,14 @@ impl RaftNode {
         // Find the highest index that a majority of servers have replicated.
         for n in (current_commit + 1)..=last_log_index {
             let mut count = 1; // Count self
-            
+
             for match_idx in match_index.values() {
                 if *match_idx >= n {
                     count += 1;
                 }
             }
-            
-            if count >= self.config.majority() {
+
+            if count >= majority {
                 // Raft safety: a leader only commits entries from its *current* term
                 // (older entries commit indirectly once a current-term entry does).
                 if let Some(term) = log.get_term(n) {
@@ -740,10 +902,10 @@ impl RaftNode {
             return;
         }
 
-        if let Some(address) = self.config.peers.get(&target) {
+        let address = self.active_peers.read().await.get(&target).cloned();
+        if let Some(address) = address {
             let transport = self.transport.clone();
             let from = self.config.node_id.clone();
-            let address = address.clone();
             // Fire-and-forget: don't block the state machine on network I/O.
             tokio::spawn(async move {
                 transport.send(&address, from, message).await;
@@ -762,6 +924,15 @@ impl RaftNode {
         };
 
         for entry in entries {
+            // Adopt committed membership changes (apply-on-commit) on every node, so
+            // leader and followers converge on the same configuration and quorum math.
+            if matches!(
+                entry.operation,
+                LogOperation::AddNode { .. } | LogOperation::RemoveNode { .. }
+            ) {
+                self.apply_membership_change(&entry.operation).await;
+            }
+
             // Apply deterministically on every node. For an append-only store, a
             // duplicate key is rejected identically on all nodes, so the outcome stays
             // consistent cluster-wide; the proposing client receives that same result.
@@ -796,6 +967,7 @@ impl Clone for RaftNode {
         // Cloning an mpsc sender points at the same channel; the receiver Arc is shared.
         RaftNode {
             config: self.config.clone(),
+            active_peers: self.active_peers.clone(),
             state: self.state.clone(),
             log: self.log.clone(),
             next_index: self.next_index.clone(),
@@ -830,14 +1002,19 @@ impl ConsensusEngine for RaftNode {
         state.leader_id.clone()
     }
     
-    async fn add_node(&self, _node_id: NodeId, _address: NodeAddress) -> Result<(), BlockDBError> {
-        // TODO: Implement cluster membership changes
-        Ok(())
+    async fn add_node(&self, node_id: NodeId, address: NodeAddress) -> Result<(), BlockDBError> {
+        if node_id == self.config.node_id {
+            return Ok(()); // adding self is a no-op
+        }
+        self.propose_membership_change(LogOperation::AddNode { node_id, address })
+            .await
     }
-    
-    async fn remove_node(&self, _node_id: &NodeId) -> Result<(), BlockDBError> {
-        // TODO: Implement cluster membership changes
-        Ok(())
+
+    async fn remove_node(&self, node_id: &NodeId) -> Result<(), BlockDBError> {
+        self.propose_membership_change(LogOperation::RemoveNode {
+            node_id: node_id.clone(),
+        })
+        .await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -44,16 +44,23 @@ async fn test_raft_node_starts_and_stops() {
     let node = RaftNode::new_local(single_node_config());
     node.start().await.unwrap();
 
-    // Membership changes are accepted (no-ops today) and the engine reports a leader view.
+    // Wait for the sole node to elect itself leader (membership changes require a
+    // leader to drive them through the log).
+    for _ in 0..100 {
+        if node.is_leader().await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(node.is_leader().await, "single node should become leader");
+
+    // A membership change now goes through the replicated log and commits.
     node.add_node(
         NodeId::from_string("node2".to_string()),
         NodeAddress::new("127.0.0.1".to_string(), 9002),
     )
     .await
     .unwrap();
-
-    // is_leader is queryable without panicking.
-    let _ = node.is_leader().await;
 
     node.stop().await;
 }

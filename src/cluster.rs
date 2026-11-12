@@ -386,6 +386,25 @@ impl ClusterNode {
         self.raft.stop().await;
     }
 
+    /// Add a node to the cluster at runtime (leader-only; replicated through the log).
+    pub async fn add_node(&self, node_id: &str, host: &str, port: u16) -> Result<(), BlockDBError> {
+        use crate::consensus::ConsensusEngine;
+        self.raft
+            .add_node(
+                NodeId::from_string(node_id.to_string()),
+                NodeAddress::new(host.to_string(), port),
+            )
+            .await
+    }
+
+    /// Remove a node from the cluster at runtime (leader-only; replicated through the log).
+    pub async fn remove_node(&self, node_id: &str) -> Result<(), BlockDBError> {
+        use crate::consensus::ConsensusEngine;
+        self.raft
+            .remove_node(&NodeId::from_string(node_id.to_string()))
+            .await
+    }
+
     async fn forward_write(
         &self,
         leader_addr: &NodeAddress,

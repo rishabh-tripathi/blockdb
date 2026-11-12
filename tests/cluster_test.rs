@@ -300,3 +300,55 @@ async fn test_secured_cluster_elects_and_replicates() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_health_and_metrics_endpoints() {
+    let cluster = spawn_cluster(1).await;
+    let _ = wait_for_leader(&cluster).await;
+    let port = cluster.ports[0];
+    cluster.nodes[0].put(b"m", b"1").await.unwrap();
+
+    // /health is open and reports healthy once a leader exists.
+    let uri = format!("http://127.0.0.1:{}/health", port);
+    let resp = Client::new().get(uri.parse().unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "healthy");
+    assert_eq!(v["has_leader"], true);
+
+    // /metrics is open and exposes Prometheus counters.
+    let uri = format!("http://127.0.0.1:{}/metrics", port);
+    let resp = Client::new().get(uri.parse().unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("blockdb_cluster_kv_writes_total"));
+    assert!(text.contains("blockdb_cluster_is_leader 1"));
+}
+
+#[tokio::test]
+async fn test_linearizable_read_from_follower() {
+    let cluster = spawn_cluster(3).await;
+    let leader = wait_for_leader(&cluster).await;
+    let follower = (leader + 1) % 3;
+
+    // Write to the leader.
+    cluster.nodes[leader].put(b"lin:key", b"committed").await.unwrap();
+
+    // A linearizable read issued at a follower must return the committed value
+    // (it forwards to the leader, which confirms leadership before answering),
+    // even immediately after the write.
+    let got = cluster.nodes[follower]
+        .get_linearizable(b"lin:key")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(b"committed".to_vec()));
+
+    // And on the leader itself.
+    let got = cluster.nodes[leader]
+        .get_linearizable(b"lin:key")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(b"committed".to_vec()));
+}

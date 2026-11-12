@@ -502,6 +502,59 @@ impl RaftNode {
         }
     }
     
+    /// Linearizable-read barrier (Raft ReadIndex, implemented via a committed no-op).
+    ///
+    /// A leader cannot safely serve a read from local state without first confirming
+    /// it is still the leader — a newer leader may have committed writes it hasn't
+    /// seen. This appends a no-op entry and waits for it to commit: commitment
+    /// requires a majority to acknowledge an entry in the leader's current term, which
+    /// proves current leadership, and applying up to that entry guarantees every write
+    /// committed before the read is reflected in local state. The caller then reads
+    /// locally and gets a linearizable result. Returns an error if this node is not
+    /// the leader (the caller should forward to the leader).
+    pub async fn linearizable_barrier(&self) -> Result<(), BlockDBError> {
+        {
+            let state = self.state.read().await;
+            if !matches!(state.state, RaftState::Leader) {
+                return Err(BlockDBError::ConsensusError("not the leader".to_string()));
+            }
+        }
+
+        let request_id = Uuid::new_v4();
+        {
+            let mut log = self.log.write().await;
+            let state = self.state.read().await;
+            let entry = LogEntry::new(
+                log.last_log_index() + 1,
+                state.current_term.clone(),
+                LogOperation::NoOp,
+                request_id,
+            );
+            drop(state);
+            log.append(entry)?;
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut client_requests = self.client_requests.lock().await;
+            client_requests.insert(request_id, tx);
+        }
+
+        self.replicate_to_followers().await;
+        self.update_commit_index().await;
+
+        let timeout_duration = self.config.election_timeout * 10;
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(_apply_result)) => Ok(()),
+            _ => {
+                self.client_requests.lock().await.remove(&request_id);
+                Err(BlockDBError::ConsensusError(
+                    "timed out confirming leadership for linearizable read".to_string(),
+                ))
+            }
+        }
+    }
+
     async fn handle_client_response(&self, request_id: Uuid, success: bool, error: Option<String>) {
         let mut client_requests = self.client_requests.lock().await;
         

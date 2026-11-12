@@ -293,14 +293,18 @@ async fn handle_request(state: Arc<AppState>, req: Request<Body>) -> Response<Bo
 
     if state.config.enable_cors {
         let headers = response.headers_mut();
-        headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+        // from_static is infallible for these constant values (no runtime parse/unwrap).
+        headers.insert(
+            "Access-Control-Allow-Origin",
+            hyper::header::HeaderValue::from_static("*"),
+        );
         headers.insert(
             "Access-Control-Allow-Methods",
-            "GET, POST, PUT, OPTIONS".parse().unwrap(),
+            hyper::header::HeaderValue::from_static("GET, POST, PUT, OPTIONS"),
         );
         headers.insert(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization".parse().unwrap(),
+            hyper::header::HeaderValue::from_static("Content-Type, Authorization"),
         );
     }
     response
@@ -403,7 +407,7 @@ fn handle_metrics(state: &Arc<AppState>) -> Response<Body> {
         .status(StatusCode::OK)
         .header("Content-Type", "text/plain; version=0.0.4")
         .body(Body::from(out))
-        .unwrap()
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 async fn handle_login(
@@ -780,11 +784,19 @@ fn json<T: Serialize>(status: StatusCode, body: &T) -> Response<Body> {
         .status(status)
         .header("Content-Type", "application/json")
         .body(Body::from(payload))
-        .unwrap()
+        // Never panic while building a response to a live request.
+        .unwrap_or_else(|_| Response::new(Body::from(payload_fallback())))
+}
+
+fn payload_fallback() -> &'static [u8] {
+    b"{\"success\":false,\"error\":\"response build failed\"}"
 }
 
 fn empty(status: StatusCode) -> Response<Body> {
-    Response::builder().status(status).body(Body::empty()).unwrap()
+    Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 fn error_status(status: StatusCode, message: &str) -> Response<Body> {

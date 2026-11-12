@@ -138,10 +138,12 @@ impl BlockChain {
         let index = self.blocks.len() as u64;
         
         let block = Block::new(index, previous_hash, records);
+        // Append-only: write just this new block's frame to disk instead of
+        // rewriting the entire chain (which made block creation O(n) and the whole
+        // chain's lifetime O(n^2)).
+        self.append_block_to_disk(&block)?;
         self.blocks.push(block);
-        
-        self.save_to_disk()?;
-        
+
         Ok(())
     }
 
@@ -186,17 +188,44 @@ impl BlockChain {
         self.create_block()
     }
 
+    /// On-disk format: a sequence of length-prefixed frames, one per block:
+    /// `[len: u32 BE][bincode(Block)]`. Appending a block is O(block) and loading
+    /// is O(chain). A torn tail frame (crash mid-append) is dropped on load.
+    ///
+    /// Full rewrite of the whole chain — only used to initialize/reset the file
+    /// (genesis, `clear`); steady-state growth goes through `append_block_to_disk`.
     fn save_to_disk(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.file_path)?,
+        );
+        for block in &self.blocks {
+            Self::write_frame(&mut file, block)?;
+        }
+        file.flush()?;
+        file.get_ref().sync_all()?;
+        Ok(())
+    }
+
+    /// Append a single block frame to the end of the file (append-only, no rewrite).
+    fn append_block_to_disk(&self, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
         let mut file = OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(true)
+            .append(true)
             .open(&self.file_path)?;
-        
-        let serialized = bincode::serialize(&self.blocks)?;
-        file.write_all(&serialized)?;
+        Self::write_frame(&mut file, block)?;
         file.flush()?;
-        
+        file.sync_data()?;
+        Ok(())
+    }
+
+    fn write_frame<W: Write>(w: &mut W, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
+        let payload = bincode::serialize(block)?;
+        w.write_all(&(payload.len() as u32).to_be_bytes())?;
+        w.write_all(&payload)?;
         Ok(())
     }
 
@@ -204,15 +233,39 @@ impl BlockChain {
         if !Path::new(&self.file_path).exists() {
             return Ok(());
         }
-        
-        let mut file = File::open(&self.file_path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        
-        if !buffer.is_empty() {
-            self.blocks = bincode::deserialize(&buffer)?;
+
+        let file = File::open(&self.file_path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+        let mut blocks = Vec::new();
+        let mut pos: u64 = 0;
+
+        loop {
+            if pos + 4 > file_len {
+                break;
+            }
+            let mut len_buf = [0u8; 4];
+            if reader.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(len_buf) as u64;
+            if pos + 4 + len > file_len {
+                break; // torn tail frame
+            }
+            let mut payload = vec![0u8; len as usize];
+            if reader.read_exact(&mut payload).is_err() {
+                break;
+            }
+            match bincode::deserialize::<Block>(&payload) {
+                Ok(block) => blocks.push(block),
+                Err(_) => break, // corrupt tail
+            }
+            pos += 4 + len;
         }
-        
+
+        if !blocks.is_empty() {
+            self.blocks = blocks;
+        }
         Ok(())
     }
 
@@ -270,5 +323,67 @@ impl BlockChain {
         self.save_to_disk()?;
         
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Record;
+    use tempfile::TempDir;
+
+    fn rec(seq: u64) -> Record {
+        Record {
+            key: format!("key{}", seq).into_bytes(),
+            value: format!("val{}", seq).into_bytes(),
+            timestamp: seq,
+            sequence_number: seq,
+            hash: vec![seq as u8; 32],
+        }
+    }
+
+    #[test]
+    fn many_blocks_append_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        {
+            let mut chain = BlockChain::new(&path).unwrap();
+            for i in 0..50 {
+                chain.add_record(rec(i)).unwrap();
+                chain.force_create_block().unwrap();
+            }
+            // genesis + 50 blocks
+            assert_eq!(chain.get_chain_length(), 51);
+            assert!(chain.verify_chain().unwrap());
+        }
+
+        // Reload from the append-only file: every block must come back intact.
+        let chain = BlockChain::new(&path).unwrap();
+        assert_eq!(chain.get_chain_length(), 51);
+        assert!(chain.verify_chain().unwrap());
+        assert_eq!(chain.get_block(50).unwrap().index, 50);
+    }
+
+    #[test]
+    fn torn_tail_frame_is_dropped_on_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let file_path = {
+            let mut chain = BlockChain::new(&path).unwrap();
+            chain.add_record(rec(1)).unwrap();
+            chain.force_create_block().unwrap();
+            chain.file_path.clone()
+        };
+
+        // Append a torn frame: claims 9999 bytes, writes only a few.
+        let mut f = OpenOptions::new().append(true).open(&file_path).unwrap();
+        f.write_all(&9999u32.to_be_bytes()).unwrap();
+        f.write_all(b"partial").unwrap();
+        f.sync_all().unwrap();
+
+        // The intact blocks (genesis + 1) survive; the torn frame is ignored.
+        let chain = BlockChain::new(&path).unwrap();
+        assert_eq!(chain.get_chain_length(), 2);
+        assert!(chain.verify_chain().unwrap());
     }
 }

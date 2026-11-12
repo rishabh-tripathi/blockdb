@@ -227,7 +227,32 @@ impl RaftNode {
     async fn handle_request_vote(&self, sender: NodeId, term: Term, candidate_id: NodeId, last_log_index: u64, last_log_term: Term) {
         let mut state = self.state.write().await;
         let log = self.log.read().await;
-        
+
+        // Leader stickiness (Raft dissertation §4.2.3): if we currently have a leader
+        // and have heard from it within the minimum election timeout, ignore this vote
+        // request outright — don't grant it and don't advance our term. This stops a
+        // partitioned or just-restarted node (whose term has drifted upward) from
+        // forcing a healthy leader to step down and causing an availability blip.
+        let heard_recently = state
+            .last_heartbeat
+            .elapsed()
+            .map(|e| e < self.config.election_timeout)
+            .unwrap_or(false);
+        if state.leader_id.is_some()
+            && state.leader_id.as_ref() != Some(&candidate_id)
+            && heard_recently
+            && !matches!(state.state, RaftState::Candidate)
+        {
+            let response = ConsensusMessage::RequestVoteResponse {
+                term: state.current_term.clone(),
+                vote_granted: false,
+            };
+            drop(state);
+            drop(log);
+            self.send_message(sender, response).await;
+            return;
+        }
+
         let mut vote_granted = false;
         let mut dirty = false;
 

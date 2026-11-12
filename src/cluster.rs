@@ -335,6 +335,13 @@ impl ClusterNode {
         self.raft.is_leader().await
     }
 
+    /// Stop this node's consensus loop. Combined with resolving the `start` shutdown
+    /// future (which stops the HTTP server), this fully quiesces the node — used to
+    /// simulate a crash before restarting from the same data directory.
+    pub async fn stop(&self) {
+        self.raft.stop().await;
+    }
+
     async fn forward_write(
         &self,
         leader_addr: &NodeAddress,

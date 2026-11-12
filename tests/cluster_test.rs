@@ -212,6 +212,7 @@ async fn test_kv_requires_api_token() {
     let security = ClusterSecurity {
         cluster_secret: None,
         api_token: Some("s3cr3t-token".to_string()),
+        tls: None,
     };
     let cluster = spawn_cluster_secure(1, security).await;
     let _ = wait_for_leader(&cluster).await;
@@ -252,6 +253,7 @@ async fn test_raft_message_requires_cluster_secret() {
     let security = ClusterSecurity {
         cluster_secret: Some("cluster-shared-secret".to_string()),
         api_token: None,
+        tls: None,
     };
     let cluster = spawn_cluster_secure(1, security).await;
     let _ = wait_for_leader(&cluster).await;
@@ -282,6 +284,7 @@ async fn test_secured_cluster_elects_and_replicates() {
     let security = ClusterSecurity {
         cluster_secret: Some("abc".to_string()),
         api_token: Some("tok".to_string()),
+        tls: None,
     };
     let cluster = spawn_cluster_secure(3, security).await;
     let leader = wait_for_leader(&cluster).await;

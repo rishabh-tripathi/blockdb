@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::consensus::log_entry::{LogEntry, LogOperation};
 use crate::consensus::raft::RaftNode;
-use crate::consensus::transport::{HttpRaftTransport, RaftEnvelope};
+use crate::consensus::transport::{HttpRaftTransport, RaftEnvelope, CLUSTER_AUTH_HEADER};
 use crate::consensus::{ClusterConfig, ConsensusEngine, NodeAddress, NodeId, StateMachine};
 use crate::error::BlockDBError;
 use crate::storage::BlockDBConfig;
@@ -77,6 +77,65 @@ pub struct ClusterStatus {
     pub cluster_size: usize,
 }
 
+/// Credentials that gate the cluster's HTTP surface.
+///
+/// Both are optional so a dev/single-node setup can run open, but in production
+/// both should be set (e.g. from a secrets manager):
+///   * `cluster_secret` — a shared secret every node presents on `/raft/message`,
+///     so a network attacker can't inject forged Raft RPCs (fake votes, bogus
+///     AppendEntries) and subvert consensus.
+///   * `api_token` — a bearer token required on client `/kv` reads and writes.
+///
+/// When a field is `None`, the corresponding endpoint is unauthenticated.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterSecurity {
+    pub cluster_secret: Option<String>,
+    pub api_token: Option<String>,
+    /// When set, the HTTP server is served over TLS. Strongly recommended in
+    /// production: the cluster secret and API token travel in request headers and
+    /// would otherwise be sent in plaintext.
+    pub tls: Option<TlsConfig>,
+}
+
+/// Paths to the PEM-encoded server certificate chain and private key for TLS.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+impl ClusterSecurity {
+    /// Build from environment: `BLOCKDB_CLUSTER_SECRET`, `BLOCKDB_API_TOKEN`.
+    /// An empty or unset variable leaves that endpoint open.
+    pub fn from_env() -> Self {
+        fn non_empty(var: &str) -> Option<String> {
+            std::env::var(var).ok().filter(|s| !s.is_empty())
+        }
+        let tls = match (non_empty("BLOCKDB_TLS_CERT"), non_empty("BLOCKDB_TLS_KEY")) {
+            (Some(cert_path), Some(key_path)) => Some(TlsConfig { cert_path, key_path }),
+            _ => None,
+        };
+        ClusterSecurity {
+            cluster_secret: non_empty("BLOCKDB_CLUSTER_SECRET"),
+            api_token: non_empty("BLOCKDB_API_TOKEN"),
+            tls,
+        }
+    }
+}
+
+/// Constant-time byte comparison, so secret checks don't leak length/content via
+/// timing. Returns true only when both slices are equal.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// One node in a BlockDB Raft cluster.
 pub struct ClusterNode {
     node_id: NodeId,
@@ -85,19 +144,36 @@ pub struct ClusterNode {
     storage: BlockDBHandle,
     raft: Arc<RaftNode>,
     forward_timeout: Duration,
+    security: ClusterSecurity,
 }
 
 impl ClusterNode {
-    /// Create a cluster node. `cluster_config` carries this node's id/address and the
-    /// addresses of its peers; `storage_config` configures the local durable store.
+    /// Create an unauthenticated cluster node (dev/single-node). Equivalent to
+    /// `new_secure` with `ClusterSecurity::default()`.
     pub fn new(
         cluster_config: ClusterConfig,
         storage_config: BlockDBConfig,
     ) -> Result<Arc<Self>, BlockDBError> {
+        Self::new_secure(cluster_config, storage_config, ClusterSecurity::default())
+    }
+
+    /// Create a cluster node. `cluster_config` carries this node's id/address and the
+    /// addresses of its peers; `storage_config` configures the local durable store;
+    /// `security` gates the Raft RPC and client KV endpoints.
+    pub fn new_secure(
+        cluster_config: ClusterConfig,
+        storage_config: BlockDBConfig,
+        security: ClusterSecurity,
+    ) -> Result<Arc<Self>, BlockDBError> {
         let data_dir = std::path::PathBuf::from(storage_config.data_dir.clone());
         let storage = BlockDBHandle::new(storage_config)?;
         let state_machine = Arc::new(BlockDBStateMachine { db: storage.clone() });
-        let transport = Arc::new(HttpRaftTransport::new());
+        // The transport signs outbound Raft RPCs with the same shared secret the
+        // server requires on inbound ones.
+        let transport = Arc::new(HttpRaftTransport::with_secret(
+            Duration::from_millis(500),
+            security.cluster_secret.clone(),
+        ));
 
         let node_id = cluster_config.node_id.clone();
         let address = cluster_config.address.clone();
@@ -119,6 +195,7 @@ impl ClusterNode {
             storage,
             raft,
             forward_timeout: Duration::from_secs(5),
+            security,
         }))
     }
 
@@ -134,6 +211,10 @@ impl ClusterNode {
             .parse()
             .map_err(|e| BlockDBError::ApiError(format!("invalid cluster address: {}", e)))?;
 
+        if let Some(tls) = self.security.tls.clone() {
+            return self.serve_tls(addr, tls, shutdown).await;
+        }
+
         let node = self.clone();
         let make_svc = make_service_fn(move |_conn| {
             let node = node.clone();
@@ -145,12 +226,69 @@ impl ClusterNode {
             }
         });
 
-        info!(node = %self.node_id.0, %addr, "cluster node listening");
+        info!(node = %self.node_id.0, %addr, "cluster node listening (plaintext)");
         Server::bind(&addr)
             .serve(make_svc)
             .with_graceful_shutdown(shutdown)
             .await
             .map_err(|e| BlockDBError::ApiError(format!("cluster server error: {}", e)))?;
+        Ok(())
+    }
+
+    /// Serve the cluster HTTP surface over TLS. Accepts connections until `shutdown`
+    /// resolves; each accepted connection is handled on its own task.
+    async fn serve_tls<F>(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        tls: TlsConfig,
+        shutdown: F,
+    ) -> Result<(), BlockDBError>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let server_config = load_server_tls_config(&tls)?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| BlockDBError::ApiError(format!("cluster TLS bind failed: {}", e)))?;
+
+        info!(node = %self.node_id.0, %addr, "cluster node listening (TLS)");
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = listener.accept() => {
+                    let (stream, _peer) = match accepted {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!("cluster TLS accept error: {}", e);
+                            continue;
+                        }
+                    };
+                    let acceptor = acceptor.clone();
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        let tls_stream = match acceptor.accept(stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("cluster TLS handshake failed: {}", e);
+                                return;
+                            }
+                        };
+                        let svc = service_fn(move |req| {
+                            let node = node.clone();
+                            async move { Ok::<_, Infallible>(node.handle(req).await) }
+                        });
+                        if let Err(e) = hyper::server::conn::Http::new()
+                            .serve_connection(tls_stream, svc)
+                            .await
+                        {
+                            warn!("cluster TLS connection error: {}", e);
+                        }
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -210,8 +348,11 @@ impl ClusterNode {
         .map_err(|e| BlockDBError::InvalidData(e.to_string()))?;
 
         let uri = format!("{}/kv", leader_addr.to_url());
-        let req = Request::post(&uri)
-            .header("content-type", "application/json")
+        let mut builder = Request::post(&uri).header("content-type", "application/json");
+        if let Some(token) = &self.security.api_token {
+            builder = builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", token));
+        }
+        let req = builder
             .body(Body::from(body))
             .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
 
@@ -243,16 +384,28 @@ impl ClusterNode {
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
 
-        let result = match (&method, path.as_str()) {
-            (&Method::POST, "/raft/message") => self.handle_raft_message(req).await,
-            (&Method::POST, "/kv") => self.handle_kv_write(req).await,
-            (&Method::GET, "/kv") => self.handle_kv_read(&query).await,
-            (&Method::GET, "/status") => self.handle_status().await,
-            _ => Ok(json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not found"}))),
+        // Authenticate before doing any work. `/status` and `/health` are left open
+        // so load balancers and operators can probe liveness without a credential.
+        let auth = match (&method, path.as_str()) {
+            (&Method::POST, "/raft/message") => self.check_cluster_auth(&req),
+            (_, "/kv") => self.check_client_auth(&req),
+            _ => Ok(()),
+        };
+
+        let result = match auth {
+            Err(e) => Err(e),
+            Ok(()) => match (&method, path.as_str()) {
+                (&Method::POST, "/raft/message") => self.handle_raft_message(req).await,
+                (&Method::POST, "/kv") => self.handle_kv_write(req).await,
+                (&Method::GET, "/kv") => self.handle_kv_read(&query).await,
+                (&Method::GET, "/status") => self.handle_status().await,
+                _ => Ok(json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not found"}))),
+            },
         };
 
         result.unwrap_or_else(|e| {
             let status = match e {
+                BlockDBError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
                 BlockDBError::DuplicateKey(_) => StatusCode::CONFLICT,
                 BlockDBError::InvalidData(_) => StatusCode::BAD_REQUEST,
                 BlockDBError::ConsensusError(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -260,6 +413,47 @@ impl ClusterNode {
             };
             json(status, &serde_json::json!({"success": false, "error": e.to_string()}))
         })
+    }
+
+    /// Reject inter-node Raft RPCs that don't carry the shared cluster secret.
+    fn check_cluster_auth(&self, req: &Request<Body>) -> Result<(), BlockDBError> {
+        let expected = match &self.security.cluster_secret {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let presented = req
+            .headers()
+            .get(CLUSTER_AUTH_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            Ok(())
+        } else {
+            Err(BlockDBError::Unauthorized(
+                "invalid or missing cluster secret".to_string(),
+            ))
+        }
+    }
+
+    /// Reject client KV requests that don't carry the `Authorization: Bearer` token.
+    fn check_client_auth(&self, req: &Request<Body>) -> Result<(), BlockDBError> {
+        let expected = match &self.security.api_token {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let presented = req
+            .headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            Ok(())
+        } else {
+            Err(BlockDBError::Unauthorized(
+                "invalid or missing API token".to_string(),
+            ))
+        }
     }
 
     async fn handle_raft_message(&self, req: Request<Body>) -> Result<Response<Body>, BlockDBError> {
@@ -319,6 +513,53 @@ impl ClusterNode {
             },
         ))
     }
+}
+
+/// Load a rustls `ServerConfig` from PEM cert-chain and private-key files.
+/// Accepts PKCS#8, PKCS#1 (RSA), or SEC1 (EC) private keys.
+fn load_server_tls_config(
+    tls: &TlsConfig,
+) -> Result<tokio_rustls::rustls::ServerConfig, BlockDBError> {
+    use std::io::BufReader;
+    use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
+
+    let cert_file = std::fs::File::open(&tls.cert_path).map_err(|e| {
+        BlockDBError::ApiError(format!("cannot open TLS cert {}: {}", tls.cert_path, e))
+    })?;
+    let certs: Vec<Certificate> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .map_err(|e| BlockDBError::ApiError(format!("bad TLS cert PEM: {}", e)))?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    if certs.is_empty() {
+        return Err(BlockDBError::ApiError(format!(
+            "no certificates found in {}",
+            tls.cert_path
+        )));
+    }
+
+    let key_file = std::fs::File::open(&tls.key_path).map_err(|e| {
+        BlockDBError::ApiError(format!("cannot open TLS key {}: {}", tls.key_path, e))
+    })?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::read_all(&mut key_reader)
+        .map_err(|e| BlockDBError::ApiError(format!("bad TLS key PEM: {}", e)))?
+        .into_iter()
+        .find_map(|item| match item {
+            rustls_pemfile::Item::PKCS8Key(k)
+            | rustls_pemfile::Item::RSAKey(k)
+            | rustls_pemfile::Item::ECKey(k) => Some(PrivateKey(k)),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            BlockDBError::ApiError(format!("no private key found in {}", tls.key_path))
+        })?;
+
+    ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| BlockDBError::ApiError(format!("invalid TLS cert/key: {}", e)))
 }
 
 fn json<T: Serialize>(status: StatusCode, body: &T) -> Response<Body> {

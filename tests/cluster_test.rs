@@ -4,7 +4,7 @@
 //! loopback ports, and verifies leader election, replicated writes converging on
 //! every node, and follower-forwarded writes — i.e. the consistency guarantees.
 
-use blockdb::cluster::{build_cluster_config, ClusterNode};
+use blockdb::cluster::{build_cluster_config, ClusterNode, ClusterSecurity};
 use blockdb::storage::BlockDBConfig;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -15,10 +15,15 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(19300);
 
 struct Cluster {
     nodes: Vec<Arc<ClusterNode>>,
+    ports: Vec<u16>,
     _dirs: Vec<TempDir>,
 }
 
 async fn spawn_cluster(size: usize) -> Cluster {
+    spawn_cluster_secure(size, ClusterSecurity::default()).await
+}
+
+async fn spawn_cluster_secure(size: usize, security: ClusterSecurity) -> Cluster {
     let base = NEXT_PORT.fetch_add(size as u16, Ordering::SeqCst);
     let ids: Vec<String> = (0..size).map(|i| format!("node{}", i)).collect();
     let peers: Vec<(String, String, u16)> = (0..size)
@@ -27,6 +32,7 @@ async fn spawn_cluster(size: usize) -> Cluster {
 
     let mut nodes = Vec::new();
     let mut dirs = Vec::new();
+    let mut ports = Vec::new();
     for i in 0..size {
         let dir = TempDir::new().unwrap();
         let storage_config = BlockDBConfig {
@@ -42,18 +48,24 @@ async fn spawn_cluster(size: usize) -> Cluster {
             Duration::from_millis(50),
             Duration::from_millis(150),
         );
-        let node = ClusterNode::new(cluster_config, storage_config).unwrap();
+        let node =
+            ClusterNode::new_secure(cluster_config, storage_config, security.clone()).unwrap();
         let n = node.clone();
         tokio::spawn(async move {
             let _ = n.start(std::future::pending::<()>()).await;
         });
         nodes.push(node);
+        ports.push(base + i as u16);
         dirs.push(dir);
     }
 
     // Let the HTTP servers bind.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    Cluster { nodes, _dirs: dirs }
+    Cluster {
+        nodes,
+        ports,
+        _dirs: dirs,
+    }
 }
 
 async fn wait_for_leader(cluster: &Cluster) -> usize {
@@ -157,5 +169,131 @@ async fn test_append_only_conflict_across_cluster() {
     // Value is unchanged on every node.
     for node in &cluster.nodes {
         assert!(wait_for_value(node, b"immutable", b"first").await);
+    }
+}
+
+// ---- Security / auth tests ----
+
+use hyper::{Body, Client, Request, StatusCode};
+
+/// POST a JSON body to a node, optionally with an `Authorization: Bearer` token and
+/// an `x-cluster-auth` secret header. Returns the HTTP status.
+async fn post(
+    port: u16,
+    path: &str,
+    body: &str,
+    bearer: Option<&str>,
+    cluster_secret: Option<&str>,
+) -> StatusCode {
+    let uri = format!("http://127.0.0.1:{}{}", port, path);
+    let mut builder = Request::post(&uri).header("content-type", "application/json");
+    if let Some(t) = bearer {
+        builder = builder.header("authorization", format!("Bearer {}", t));
+    }
+    if let Some(s) = cluster_secret {
+        builder = builder.header("x-cluster-auth", s);
+    }
+    let req = builder.body(Body::from(body.to_string())).unwrap();
+    Client::new().request(req).await.unwrap().status()
+}
+
+async fn get_status(port: u16, path: &str, bearer: Option<&str>) -> StatusCode {
+    let uri = format!("http://127.0.0.1:{}{}", port, path);
+    let mut builder = Request::get(&uri);
+    if let Some(t) = bearer {
+        builder = builder.header("authorization", format!("Bearer {}", t));
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    Client::new().request(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn test_kv_requires_api_token() {
+    let security = ClusterSecurity {
+        cluster_secret: None,
+        api_token: Some("s3cr3t-token".to_string()),
+    };
+    let cluster = spawn_cluster_secure(1, security).await;
+    let _ = wait_for_leader(&cluster).await;
+    let port = cluster.ports[0];
+
+    let write = r#"{"key":"k","value":"v"}"#;
+
+    // No token → rejected.
+    assert_eq!(
+        post(port, "/kv", write, None, None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Wrong token → rejected.
+    assert_eq!(
+        post(port, "/kv", write, Some("wrong"), None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Correct token → accepted.
+    assert_eq!(
+        post(port, "/kv", write, Some("s3cr3t-token"), None).await,
+        StatusCode::OK
+    );
+    // Reads are gated too.
+    assert_eq!(
+        get_status(port, "/kv?key=k", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_status(port, "/kv?key=k", Some("s3cr3t-token")).await,
+        StatusCode::OK
+    );
+    // Liveness endpoint stays open.
+    assert_eq!(get_status(port, "/status", None).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_raft_message_requires_cluster_secret() {
+    let security = ClusterSecurity {
+        cluster_secret: Some("cluster-shared-secret".to_string()),
+        api_token: None,
+    };
+    let cluster = spawn_cluster_secure(1, security).await;
+    let _ = wait_for_leader(&cluster).await;
+    let port = cluster.ports[0];
+
+    // A forged Raft RPC with no secret is rejected before the body is even parsed.
+    assert_eq!(
+        post(port, "/raft/message", "{}", None, None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Wrong secret → rejected.
+    assert_eq!(
+        post(port, "/raft/message", "{}", None, Some("nope")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Correct secret passes auth; the empty body then fails to parse (400),
+    // which proves the secret gate let it through.
+    assert_eq!(
+        post(port, "/raft/message", "{}", None, Some("cluster-shared-secret")).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn test_secured_cluster_elects_and_replicates() {
+    // Both secrets set: inter-node RPCs must carry the cluster secret (or no leader
+    // is ever elected) and forwarded writes must carry the API token.
+    let security = ClusterSecurity {
+        cluster_secret: Some("abc".to_string()),
+        api_token: Some("tok".to_string()),
+    };
+    let cluster = spawn_cluster_secure(3, security).await;
+    let leader = wait_for_leader(&cluster).await;
+    let follower = (leader + 1) % 3;
+
+    // Internal write via a follower forwards to the leader with the token attached.
+    cluster.nodes[follower].put(b"secured", b"yes").await.unwrap();
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        assert!(
+            wait_for_value(node, b"secured", b"yes").await,
+            "node {} never received the replicated write under auth",
+            i
+        );
     }
 }

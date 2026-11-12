@@ -9,7 +9,7 @@
 //! being applied on every node; a write sent to a follower is forwarded to the leader.
 
 use blockdb::api::shutdown_signal;
-use blockdb::cluster::{build_cluster_config, ClusterNode};
+use blockdb::cluster::{build_cluster_config, ClusterNode, ClusterSecurity};
 use blockdb::storage::BlockDBConfig;
 use clap::Parser;
 use std::time::Duration;
@@ -40,6 +40,25 @@ struct Args {
 
     #[arg(long, default_value = "300")]
     election_timeout_ms: u64,
+
+    /// Shared secret required on inter-node /raft/message RPCs. When unset the
+    /// Raft endpoint is unauthenticated — set it in any real deployment.
+    #[arg(long, env = "BLOCKDB_CLUSTER_SECRET")]
+    cluster_secret: Option<String>,
+
+    /// Bearer token required on client /kv reads and writes. When unset the KV
+    /// endpoint is unauthenticated.
+    #[arg(long, env = "BLOCKDB_API_TOKEN")]
+    api_token: Option<String>,
+
+    /// Path to a PEM server certificate chain. Enables TLS when given together
+    /// with --tls-key.
+    #[arg(long, env = "BLOCKDB_TLS_CERT")]
+    tls_cert: Option<String>,
+
+    /// Path to the PEM private key matching --tls-cert.
+    #[arg(long, env = "BLOCKDB_TLS_KEY")]
+    tls_key: Option<String>,
 }
 
 fn parse_peers(spec: &str) -> Result<Vec<(String, String, u16)>, String> {
@@ -94,7 +113,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting BlockDB cluster node"
     );
 
-    let node = ClusterNode::new(cluster_config, storage_config)?;
+    let tls = match (
+        args.tls_cert.filter(|s| !s.is_empty()),
+        args.tls_key.filter(|s| !s.is_empty()),
+    ) {
+        (Some(cert_path), Some(key_path)) => Some(blockdb::cluster::TlsConfig { cert_path, key_path }),
+        (None, None) => None,
+        _ => {
+            return Err("both --tls-cert and --tls-key must be provided together".into());
+        }
+    };
+    let security = ClusterSecurity {
+        cluster_secret: args.cluster_secret.filter(|s| !s.is_empty()),
+        api_token: args.api_token.filter(|s| !s.is_empty()),
+        tls,
+    };
+    if security.cluster_secret.is_none() {
+        tracing::warn!("no --cluster-secret set: /raft/message is UNAUTHENTICATED");
+    }
+    if security.api_token.is_none() {
+        tracing::warn!("no --api-token set: /kv is UNAUTHENTICATED");
+    }
+    if security.tls.is_none() {
+        tracing::warn!("no --tls-cert/--tls-key set: traffic (incl. secrets) is PLAINTEXT");
+    }
+
+    let node = ClusterNode::new_secure(cluster_config, storage_config, security)?;
     node.start(shutdown_signal()).await?;
     Ok(())
 }

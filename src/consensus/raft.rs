@@ -12,7 +12,9 @@ use crate::consensus::{
     ConsensusEngine, ConsensusState, StateMachine,
 };
 use crate::consensus::log_entry::{LogEntry, LogOperation, ReplicatedLog};
-use crate::consensus::persistence::{HardState, HardStateStore, LogStore};
+use crate::consensus::persistence::{
+    HardState, HardStateStore, LogStore, SnapshotMeta, SnapshotStore,
+};
 use crate::consensus::transport::{NoopTransport, RaftTransport};
 use crate::error::BlockDBError;
 use crate::transaction::Operation;
@@ -39,6 +41,9 @@ pub struct RaftNode {
     votes_received: Arc<Mutex<HashSet<NodeId>>>,
     /// Durable store for `currentTerm`/`votedFor`. `None` for in-memory/test nodes.
     hard_state_store: Option<Arc<Mutex<HardStateStore>>>,
+    /// Durable store for the log-compaction snapshot baseline + membership. `None` for
+    /// in-memory/test nodes.
+    snapshot_store: Option<Arc<Mutex<SnapshotStore>>>,
 }
 
 impl RaftNode {
@@ -67,6 +72,7 @@ impl RaftNode {
             state_machine,
             votes_received: Arc::new(Mutex::new(HashSet::new())),
             hard_state_store: None,
+            snapshot_store: None,
         }
     }
 
@@ -82,24 +88,52 @@ impl RaftNode {
         let raft_dir = data_dir.join("raft");
         let (hs_store, hard) = HardStateStore::open(&raft_dir)
             .map_err(|e| BlockDBError::ConsensusError(format!("open raft hard state: {}", e)))?;
-        let (log_store, entries) = LogStore::open(&raft_dir)
+        let (snap_store, snap) = SnapshotStore::open(&raft_dir)
+            .map_err(|e| BlockDBError::ConsensusError(format!("open raft snapshot: {}", e)))?;
+        let (log_store, all_entries) = LogStore::open(&raft_dir)
             .map_err(|e| BlockDBError::ConsensusError(format!("open raft log: {}", e)))?;
+
+        // Reconcile against the snapshot baseline: drop any persisted entries at or
+        // below base_index (a crash between writing the snapshot and rewriting the log
+        // can leave such entries behind).
+        let base_index = snap.base_index;
+        let base_term = Term(snap.base_term);
+        let entries: Vec<LogEntry> = all_entries
+            .into_iter()
+            .filter(|e| e.index > base_index)
+            .collect();
 
         // Restore persisted term/vote into the in-memory consensus state.
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_term = Term(hard.current_term);
         consensus_state.voted_for = hard.voted_for.clone().map(NodeId::from_string);
 
-        // Rebuild the effective membership by folding AddNode/RemoveNode entries from
-        // the recovered log onto the initial configured peer set.
-        let active_peers = Self::fold_membership(config.peers.clone(), &entries);
+        // Rebuild membership: start from the snapshot's membership if it recorded one
+        // (it captured the config as of base_index, so compacted AddNode/RemoveNode
+        // entries aren't lost), else the configured peers; then fold the surviving log.
+        let base_membership: HashMap<NodeId, NodeAddress> = if snap.membership.is_empty() {
+            config.peers.clone()
+        } else {
+            snap.membership
+                .iter()
+                .map(|(id, host, port)| {
+                    (
+                        NodeId::from_string(id.clone()),
+                        NodeAddress::new(host.clone(), *port),
+                    )
+                })
+                .collect()
+        };
+        let active_peers = Self::fold_membership(base_membership, &entries);
 
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
         Ok(RaftNode {
             config,
             active_peers: Arc::new(RwLock::new(active_peers)),
             state: Arc::new(RwLock::new(consensus_state)),
-            log: Arc::new(RwLock::new(ReplicatedLog::with_store(log_store, entries))),
+            log: Arc::new(RwLock::new(ReplicatedLog::with_store(
+                log_store, entries, base_index, base_term,
+            ))),
             next_index: Arc::new(RwLock::new(HashMap::new())),
             match_index: Arc::new(RwLock::new(HashMap::new())),
             message_sender,
@@ -110,6 +144,7 @@ impl RaftNode {
             state_machine,
             votes_received: Arc::new(Mutex::new(HashSet::new())),
             hard_state_store: Some(Arc::new(Mutex::new(hs_store))),
+            snapshot_store: Some(Arc::new(Mutex::new(snap_store))),
         })
     }
 
@@ -947,6 +982,62 @@ impl RaftNode {
                 let _ = sender.send(apply_result);
             }
         }
+
+        // Having applied more entries, consider compacting the log tail.
+        self.maybe_compact().await;
+    }
+
+    /// Compact the applied prefix of the log when it has grown past the retention
+    /// tail. Durability order matters: record the new snapshot baseline + membership
+    /// first, then rewrite the log file, so a crash in between is reconciled on load.
+    async fn maybe_compact(&self) {
+        let snapshot_store = match &self.snapshot_store {
+            Some(s) => s,
+            None => return, // in-memory node: nothing to persist/compact
+        };
+
+        // Decide the compaction point and capture the boundary term.
+        let (target, base_term) = {
+            let log = self.log.read().await;
+            match log.compaction_target() {
+                Some(t) => match log.term_at(t) {
+                    Some(term) => (t, term.0),
+                    None => return,
+                },
+                None => return,
+            }
+        };
+
+        // Snapshot the membership as of the baseline so a restart can rebuild the
+        // configuration even after the config entries are compacted away.
+        let membership: Vec<(String, String, u16)> = self
+            .active_peers
+            .read()
+            .await
+            .iter()
+            .map(|(id, addr)| (id.0.clone(), addr.host.clone(), addr.port))
+            .collect();
+
+        let meta = SnapshotMeta {
+            base_index: target,
+            base_term,
+            membership,
+        };
+        {
+            let store = snapshot_store.lock().await;
+            if let Err(e) = store.save(&meta) {
+                tracing::error!(error = %e, "failed to persist raft snapshot baseline; skipping compaction");
+                return;
+            }
+        }
+
+        // Now truncate the log in memory + on disk.
+        let mut log = self.log.write().await;
+        if let Err(e) = log.compact(target) {
+            tracing::error!(error = %e, "log compaction failed after snapshot write");
+        } else {
+            tracing::info!(base_index = target, "compacted raft log");
+        }
     }
 }
 
@@ -980,6 +1071,7 @@ impl Clone for RaftNode {
             state_machine: self.state_machine.clone(),
             votes_received: self.votes_received.clone(),
             hard_state_store: self.hard_state_store.clone(),
+            snapshot_store: self.snapshot_store.clone(),
         }
     }
 }

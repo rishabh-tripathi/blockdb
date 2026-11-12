@@ -25,6 +25,67 @@ pub struct HardState {
     pub voted_for: Option<String>,
 }
 
+/// Compaction snapshot metadata: the log baseline plus the cluster membership as of
+/// that baseline. BlockDB's key/value data is NOT snapshotted here — it is already
+/// durably stored by the state machine — so this stays tiny. Membership is kept so a
+/// restart can reconstruct the configuration even if the AddNode/RemoveNode entries
+/// that produced it have been compacted away.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub base_index: u64,
+    pub base_term: u64,
+    /// (node_id, host, port) for each peer in the configuration at `base_index`.
+    pub membership: Vec<(String, String, u16)>,
+}
+
+/// Persists the compaction snapshot metadata with the same atomic rewrite as the hard
+/// state (temp file + fsync + rename + dir fsync).
+#[derive(Debug)]
+pub struct SnapshotStore {
+    path: PathBuf,
+    tmp_path: PathBuf,
+}
+
+impl SnapshotStore {
+    pub fn open(dir: &Path) -> Result<(Self, SnapshotMeta), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("snapshot.bin");
+        let tmp_path = dir.join("snapshot.bin.tmp");
+        let meta = if path.exists() {
+            let mut buf = Vec::new();
+            File::open(&path)?.read_to_end(&mut buf)?;
+            if buf.is_empty() {
+                SnapshotMeta::default()
+            } else {
+                bincode::deserialize(&buf).unwrap_or_default()
+            }
+        } else {
+            SnapshotMeta::default()
+        };
+        Ok((SnapshotStore { path, tmp_path }, meta))
+    }
+
+    pub fn save(&self, meta: &SnapshotMeta) -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = bincode::serialize(meta)?;
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.tmp_path)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&self.tmp_path, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Persists `currentTerm` / `votedFor` by atomically rewriting a small file and
 /// fsyncing it. Rewritten in full on every change — the state is tiny.
 #[derive(Debug)]
@@ -255,5 +316,74 @@ mod tests {
 
         let (_s, entries) = LogStore::open(dir.path()).unwrap();
         assert_eq!(entries.len(), 1, "torn tail frame must be dropped");
+    }
+
+    #[test]
+    fn snapshot_meta_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let (store, meta) = SnapshotStore::open(dir.path()).unwrap();
+        assert_eq!(meta.base_index, 0);
+        store
+            .save(&SnapshotMeta {
+                base_index: 42,
+                base_term: 3,
+                membership: vec![("n1".into(), "10.0.0.1".into(), 8080)],
+            })
+            .unwrap();
+
+        let (_s2, reloaded) = SnapshotStore::open(dir.path()).unwrap();
+        assert_eq!(reloaded.base_index, 42);
+        assert_eq!(reloaded.base_term, 3);
+        assert_eq!(reloaded.membership.len(), 1);
+        assert_eq!(reloaded.membership[0].2, 8080);
+    }
+
+    #[test]
+    fn compaction_persists_and_reconciles_on_restart() {
+        use crate::consensus::log_entry::ReplicatedLog;
+
+        let dir = TempDir::new().unwrap();
+
+        // Phase 1: durable log with a small retention; append, apply, compact.
+        {
+            let (log_store, loaded) = LogStore::open(dir.path()).unwrap();
+            assert!(loaded.is_empty());
+            let mut log = ReplicatedLog::with_store(log_store, Vec::new(), 0, Term(0));
+            log.set_compaction_retention(2);
+            for i in 1..=8 {
+                log.append(entry(i, 1)).unwrap();
+            }
+            log.update_commit_index(8);
+            log.apply_up_to(8);
+
+            // Simulate the node's compaction ordering: record the snapshot baseline
+            // first, then compact the log file.
+            let target = log.compaction_target().expect("should want compaction");
+            let base_term = log.term_at(target).unwrap().0;
+            let (snap_store, _) = SnapshotStore::open(dir.path()).unwrap();
+            snap_store
+                .save(&SnapshotMeta {
+                    base_index: target,
+                    base_term,
+                    membership: vec![],
+                })
+                .unwrap();
+            log.compact(target).unwrap();
+            assert_eq!(log.base_index(), target);
+        }
+
+        // Phase 2: restart — reload snapshot + log and reconcile (drop entries at or
+        // below base_index), exactly as RaftNode::new_persistent does.
+        let (_snap_store, meta) = SnapshotStore::open(dir.path()).unwrap();
+        let (log_store, all_entries) = LogStore::open(dir.path()).unwrap();
+        let base = meta.base_index;
+        assert!(base >= 6, "expected compaction to advance the base index");
+        let kept: Vec<LogEntry> = all_entries.into_iter().filter(|e| e.index > base).collect();
+        let log = ReplicatedLog::with_store(log_store, kept, base, Term(meta.base_term));
+
+        assert_eq!(log.base_index(), base);
+        assert_eq!(log.last_log_index(), 8, "all 8 indices still accounted for");
+        assert_eq!(log.get_entry(8).unwrap().index, 8);
+        assert!(log.get_entry(base).is_none(), "compacted entry stays gone after restart");
     }
 }

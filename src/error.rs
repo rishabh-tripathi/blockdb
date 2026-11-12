@@ -12,6 +12,7 @@ pub enum BlockDBError {
     AuthError(crate::auth::AuthError),
     ConsensusError(String),
     TransactionError(String),
+    Unauthorized(String),
 }
 
 impl fmt::Display for BlockDBError {
@@ -27,6 +28,7 @@ impl fmt::Display for BlockDBError {
             BlockDBError::AuthError(e) => write!(f, "Authentication Error: {}", e),
             BlockDBError::ConsensusError(msg) => write!(f, "Consensus Error: {}", msg),
             BlockDBError::TransactionError(msg) => write!(f, "Transaction Error: {}", msg),
+            BlockDBError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
         }
     }
 }

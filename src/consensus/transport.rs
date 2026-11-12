@@ -40,20 +40,38 @@ impl RaftTransport for NoopTransport {
     async fn send(&self, _target: &NodeAddress, _from: NodeId, _message: ConsensusMessage) {}
 }
 
+/// Header carrying the pre-shared cluster secret on inter-node Raft RPCs.
+pub const CLUSTER_AUTH_HEADER: &str = "x-cluster-auth";
+
 /// HTTP transport: POSTs each message to `http://<host>:<port>/raft/message`.
 pub struct HttpRaftTransport {
     timeout: Duration,
+    /// Pre-shared secret attached to every outbound Raft RPC so peers can reject
+    /// forged consensus messages. `None` = unauthenticated (dev/single-node).
+    cluster_secret: Option<String>,
 }
 
 impl HttpRaftTransport {
     pub fn new() -> Self {
         HttpRaftTransport {
             timeout: Duration::from_millis(500),
+            cluster_secret: None,
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
-        HttpRaftTransport { timeout }
+        HttpRaftTransport {
+            timeout,
+            cluster_secret: None,
+        }
+    }
+
+    /// Transport that signs every outbound Raft RPC with `cluster_secret`.
+    pub fn with_secret(timeout: Duration, cluster_secret: Option<String>) -> Self {
+        HttpRaftTransport {
+            timeout,
+            cluster_secret,
+        }
     }
 }
 
@@ -72,10 +90,11 @@ impl RaftTransport for HttpRaftTransport {
             Err(_) => return,
         };
         let uri = format!("{}/raft/message", target.to_url());
-        let req = match Request::post(&uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-        {
+        let mut builder = Request::post(&uri).header("content-type", "application/json");
+        if let Some(secret) = &self.cluster_secret {
+            builder = builder.header(CLUSTER_AUTH_HEADER, secret);
+        }
+        let req = match builder.body(Body::from(body)) {
             Ok(r) => r,
             Err(_) => return,
         };

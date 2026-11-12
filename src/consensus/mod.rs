@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub mod raft;
 pub mod log_entry;
 pub mod transport;
+pub mod persistence;
 
 /// A replicated state machine that applies committed Raft log entries.
 ///

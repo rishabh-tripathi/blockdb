@@ -104,26 +104,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting BlockDB server"
     );
 
+    // Persist auth state (user accounts + permissions) alongside the data, so
+    // accounts survive a restart instead of resetting to the default admin.
+    let auth_dir = Path::new(&db_config.data_dir).join("auth");
     let db_handle = BlockDBHandle::new(db_config)?;
 
     let server = if api_config.auth_enabled {
         let auth_config = AuthConfig::default();
+        let am = AuthManager::new_persistent(auth_config, &auth_dir);
         if let (Ok(user), Ok(pass)) = (
             std::env::var("BLOCKDB_ADMIN_USER"),
             std::env::var("BLOCKDB_ADMIN_PASSWORD"),
         ) {
-            // Bootstrap an admin from the environment; the manager also seeds a
-            // default admin if none is configured.
-            let am = AuthManager::new(auth_config.clone());
+            // Bootstrap an admin from the environment (ignored if it already exists
+            // from a previous run).
             let _ = am.create_admin_user(user, &pass);
-            BlockDBServer::with_auth(db_handle, api_config, am)
         } else {
             tracing::warn!(
                 "auth enabled but BLOCKDB_ADMIN_USER/BLOCKDB_ADMIN_PASSWORD not set; \
                  using the built-in default admin — change the password immediately"
             );
-            BlockDBServer::with_auth(db_handle, api_config, AuthManager::new(auth_config))
         }
+        BlockDBServer::with_auth(db_handle, api_config, am)
     } else {
         tracing::warn!("authentication is DISABLED");
         BlockDBServer::new(db_handle, api_config)

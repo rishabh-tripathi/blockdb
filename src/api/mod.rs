@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -141,6 +142,9 @@ struct AppState {
     auth_manager: Option<Arc<RwLock<AuthManager>>>,
     metrics: Metrics,
     start_time: std::time::Instant,
+    /// Bounds the number of requests served concurrently (config.max_connections);
+    /// excess requests are shed with 503 rather than exhausting memory/CPU.
+    conn_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct BlockDBServer {
@@ -150,6 +154,7 @@ pub struct BlockDBServer {
 impl BlockDBServer {
     pub fn new(db: BlockDBHandle, config: ApiConfig) -> Self {
         let consent = ConsentStore::new(db.clone());
+        let conn_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_connections.max(1)));
         BlockDBServer {
             state: Arc::new(AppState {
                 db,
@@ -158,12 +163,14 @@ impl BlockDBServer {
                 auth_manager: None,
                 metrics: Metrics::default(),
                 start_time: std::time::Instant::now(),
+                conn_limiter,
             }),
         }
     }
 
     pub fn with_auth(db: BlockDBHandle, config: ApiConfig, auth_manager: AuthManager) -> Self {
         let consent = ConsentStore::new(db.clone());
+        let conn_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_connections.max(1)));
         BlockDBServer {
             state: Arc::new(AppState {
                 db,
@@ -172,6 +179,7 @@ impl BlockDBServer {
                 auth_manager: Some(Arc::new(RwLock::new(auth_manager))),
                 metrics: Metrics::default(),
                 start_time: std::time::Instant::now(),
+                conn_limiter,
             }),
         }
     }
@@ -191,7 +199,7 @@ impl BlockDBServer {
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
                     let state = state.clone();
-                    async move { Ok::<_, Infallible>(handle_request(state, req).await) }
+                    async move { Ok::<_, Infallible>(serve_one(state, req).await) }
                 }))
             }
         });
@@ -241,6 +249,35 @@ pub async fn shutdown_signal() {
 // Routing
 // ---------------------------------------------------------------------------
 
+/// Enforce the connection cap and per-request timeout around `handle_request`.
+async fn serve_one(state: Arc<AppState>, req: Request<Body>) -> Response<Body> {
+    // Shed load when at the concurrency cap instead of queueing unboundedly.
+    let _permit = match state.conn_limiter.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({
+                    "success": false,
+                    "error": "server at capacity, retry later",
+                }),
+            );
+        }
+    };
+
+    let timeout = Duration::from_secs(state.config.request_timeout.max(1));
+    match tokio::time::timeout(timeout, handle_request(state, req)).await {
+        Ok(resp) => resp,
+        Err(_) => json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({
+                "success": false,
+                "error": "request timed out",
+            }),
+        ),
+    }
+}
+
 async fn handle_request(state: Arc<AppState>, req: Request<Body>) -> Response<Body> {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
@@ -256,14 +293,18 @@ async fn handle_request(state: Arc<AppState>, req: Request<Body>) -> Response<Bo
 
     if state.config.enable_cors {
         let headers = response.headers_mut();
-        headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+        // from_static is infallible for these constant values (no runtime parse/unwrap).
+        headers.insert(
+            "Access-Control-Allow-Origin",
+            hyper::header::HeaderValue::from_static("*"),
+        );
         headers.insert(
             "Access-Control-Allow-Methods",
-            "GET, POST, PUT, OPTIONS".parse().unwrap(),
+            hyper::header::HeaderValue::from_static("GET, POST, PUT, OPTIONS"),
         );
         headers.insert(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization".parse().unwrap(),
+            hyper::header::HeaderValue::from_static("Content-Type, Authorization"),
         );
     }
     response
@@ -366,7 +407,7 @@ fn handle_metrics(state: &Arc<AppState>) -> Response<Body> {
         .status(StatusCode::OK)
         .header("Content-Type", "text/plain; version=0.0.4")
         .body(Body::from(out))
-        .unwrap()
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 async fn handle_login(
@@ -743,11 +784,19 @@ fn json<T: Serialize>(status: StatusCode, body: &T) -> Response<Body> {
         .status(status)
         .header("Content-Type", "application/json")
         .body(Body::from(payload))
-        .unwrap()
+        // Never panic while building a response to a live request.
+        .unwrap_or_else(|_| Response::new(Body::from(payload_fallback())))
+}
+
+fn payload_fallback() -> &'static [u8] {
+    b"{\"success\":false,\"error\":\"response build failed\"}"
 }
 
 fn empty(status: StatusCode) -> Response<Body> {
-    Response::builder().status(status).body(Body::empty()).unwrap()
+    Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 fn error_status(status: StatusCode, message: &str) -> Response<Body> {

@@ -94,6 +94,7 @@ impl ClusterNode {
         cluster_config: ClusterConfig,
         storage_config: BlockDBConfig,
     ) -> Result<Arc<Self>, BlockDBError> {
+        let data_dir = std::path::PathBuf::from(storage_config.data_dir.clone());
         let storage = BlockDBHandle::new(storage_config)?;
         let state_machine = Arc::new(BlockDBStateMachine { db: storage.clone() });
         let transport = Arc::new(HttpRaftTransport::new());
@@ -102,7 +103,14 @@ impl ClusterNode {
         let address = cluster_config.address.clone();
         let peers = cluster_config.peers.clone();
 
-        let raft = Arc::new(RaftNode::new(cluster_config, transport, state_machine));
+        // Durably persist the Raft log + hard state under <data_dir>/raft so a
+        // restarted node recovers its term, vote, and committed log.
+        let raft = Arc::new(RaftNode::new_persistent(
+            cluster_config,
+            transport,
+            state_machine,
+            &data_dir,
+        )?);
 
         Ok(Arc::new(ClusterNode {
             node_id,

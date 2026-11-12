@@ -1,5 +1,7 @@
 use serde::{Serialize, Deserialize};
 use crate::consensus::{Term, NodeId};
+use crate::consensus::persistence::LogStore;
+use crate::error::BlockDBError;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,38 +58,76 @@ pub struct ReplicatedLog {
     entries: Vec<LogEntry>,
     commit_index: u64,
     last_applied: u64,
+    /// Durable backing store. When present, every log mutation is fsync'd before it
+    /// is acknowledged, so committed entries survive a crash (Raft durability).
+    store: Option<LogStore>,
 }
 
 impl ReplicatedLog {
+    /// In-memory-only log (tests, single-node demos without persistence).
     pub fn new() -> Self {
         ReplicatedLog {
             entries: Vec::new(),
             commit_index: 0,
             last_applied: 0,
+            store: None,
         }
     }
-    
-    pub fn append(&mut self, entry: LogEntry) {
-        self.entries.push(entry);
+
+    /// Durable log: `store` holds the already-loaded entries recovered from disk.
+    pub fn with_store(store: LogStore, entries: Vec<LogEntry>) -> Self {
+        ReplicatedLog {
+            entries,
+            commit_index: 0,
+            last_applied: 0,
+            store: Some(store),
+        }
     }
-    
-    pub fn append_entries(&mut self, prev_log_index: u64, entries: Vec<LogEntry>) -> bool {
+
+    /// Append one entry, persisting it durably first (leader path).
+    pub fn append(&mut self, entry: LogEntry) -> Result<(), BlockDBError> {
+        if let Some(store) = self.store.as_mut() {
+            store
+                .append(&entry)
+                .map_err(|e| BlockDBError::ConsensusError(format!("log persist failed: {}", e)))?;
+        }
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// Follower AppendEntries: truncate conflicts and append new entries, each change
+    /// made durable before the follower acknowledges success.
+    pub fn append_entries(
+        &mut self,
+        prev_log_index: u64,
+        entries: Vec<LogEntry>,
+    ) -> Result<bool, BlockDBError> {
         // Validate prev_log_index
         if prev_log_index > 0 && prev_log_index as usize > self.entries.len() {
-            return false;
+            return Ok(false);
         }
-        
-        // Check if we need to truncate conflicting entries
+
+        // Truncate conflicting suffix (durably rewrite the prefix that survives).
         if prev_log_index < self.entries.len() as u64 {
             self.entries.truncate(prev_log_index as usize);
+            if let Some(store) = self.store.as_mut() {
+                store.rewrite(&self.entries).map_err(|e| {
+                    BlockDBError::ConsensusError(format!("log truncate persist failed: {}", e))
+                })?;
+            }
         }
-        
-        // Append new entries
+
+        // Append new entries, persisting each before it is visible.
         for entry in entries {
+            if let Some(store) = self.store.as_mut() {
+                store.append(&entry).map_err(|e| {
+                    BlockDBError::ConsensusError(format!("log append persist failed: {}", e))
+                })?;
+            }
             self.entries.push(entry);
         }
-        
-        true
+
+        Ok(true)
     }
     
     pub fn get_entry(&self, index: u64) -> Option<&LogEntry> {

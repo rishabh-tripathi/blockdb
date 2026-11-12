@@ -12,6 +12,7 @@ use crate::consensus::{
     ConsensusEngine, ConsensusState, StateMachine,
 };
 use crate::consensus::log_entry::{LogEntry, LogOperation, ReplicatedLog};
+use crate::consensus::persistence::{HardState, HardStateStore, LogStore};
 use crate::consensus::transport::{NoopTransport, RaftTransport};
 use crate::error::BlockDBError;
 use crate::transaction::Operation;
@@ -32,6 +33,8 @@ pub struct RaftNode {
     state_machine: Arc<dyn StateMachine>,
     /// Peers that granted their vote in the current election (leader elected at majority).
     votes_received: Arc<Mutex<HashSet<NodeId>>>,
+    /// Durable store for `currentTerm`/`votedFor`. `None` for in-memory/test nodes.
+    hard_state_store: Option<Arc<Mutex<HardStateStore>>>,
 }
 
 impl RaftNode {
@@ -57,13 +60,65 @@ impl RaftNode {
             transport,
             state_machine,
             votes_received: Arc::new(Mutex::new(HashSet::new())),
+            hard_state_store: None,
         }
+    }
+
+    /// Construct a node that durably persists its Raft log and hard state under
+    /// `data_dir/raft/`, recovering both on startup. This is the production
+    /// configuration — a restarted node resumes its term, vote, and committed log.
+    pub fn new_persistent(
+        config: ClusterConfig,
+        transport: Arc<dyn RaftTransport>,
+        state_machine: Arc<dyn StateMachine>,
+        data_dir: &std::path::Path,
+    ) -> Result<Self, BlockDBError> {
+        let raft_dir = data_dir.join("raft");
+        let (hs_store, hard) = HardStateStore::open(&raft_dir)
+            .map_err(|e| BlockDBError::ConsensusError(format!("open raft hard state: {}", e)))?;
+        let (log_store, entries) = LogStore::open(&raft_dir)
+            .map_err(|e| BlockDBError::ConsensusError(format!("open raft log: {}", e)))?;
+
+        // Restore persisted term/vote into the in-memory consensus state.
+        let mut consensus_state = ConsensusState::new();
+        consensus_state.current_term = Term(hard.current_term);
+        consensus_state.voted_for = hard.voted_for.clone().map(NodeId::from_string);
+
+        let (message_sender, message_receiver) = mpsc::unbounded_channel();
+        Ok(RaftNode {
+            config,
+            state: Arc::new(RwLock::new(consensus_state)),
+            log: Arc::new(RwLock::new(ReplicatedLog::with_store(log_store, entries))),
+            next_index: Arc::new(RwLock::new(HashMap::new())),
+            match_index: Arc::new(RwLock::new(HashMap::new())),
+            message_sender,
+            message_receiver: Arc::new(Mutex::new(message_receiver)),
+            client_requests: Arc::new(Mutex::new(HashMap::new())),
+            is_running: Arc::new(RwLock::new(false)),
+            transport,
+            state_machine,
+            votes_received: Arc::new(Mutex::new(HashSet::new())),
+            hard_state_store: Some(Arc::new(Mutex::new(hs_store))),
+        })
     }
 
     /// Construct a node with a no-op transport and no-op state machine. Useful for
     /// smoke tests of the local state machine without networking or storage.
     pub fn new_local(config: ClusterConfig) -> Self {
         Self::new(config, Arc::new(NoopTransport), Arc::new(NoopStateMachine))
+    }
+
+    /// Durably persist `currentTerm`/`votedFor`. Must be called (and awaited) after a
+    /// term or vote change and before the node acts on it externally (replies to a
+    /// vote, sends RequestVote), so a crash never causes a double-vote or lost term.
+    async fn persist_hard_state(&self, current_term: u64, voted_for: Option<String>) {
+        if let Some(store) = &self.hard_state_store {
+            let hs = HardState { current_term, voted_for };
+            let store = store.lock().await;
+            if let Err(e) = store.save(&hs) {
+                tracing::error!(error = %e, "failed to persist raft hard state");
+            }
+        }
     }
 
     /// A handle for injecting messages received over the network into this node's
@@ -174,14 +229,16 @@ impl RaftNode {
         let log = self.log.read().await;
         
         let mut vote_granted = false;
-        
+        let mut dirty = false;
+
         // Update term if newer
         if term.0 > state.current_term.0 {
             state.current_term = term.clone();
             state.voted_for = None;
             state.state = RaftState::Follower;
+            dirty = true;
         }
-        
+
         // Grant vote if conditions are met
         if term.0 == state.current_term.0 &&
            (state.voted_for.is_none() || state.voted_for.as_ref() == Some(&candidate_id)) &&
@@ -189,16 +246,25 @@ impl RaftNode {
             vote_granted = true;
             state.voted_for = Some(candidate_id);
             state.last_heartbeat = SystemTime::now();
+            dirty = true;
         }
-        
+
         let response = ConsensusMessage::RequestVoteResponse {
             term: state.current_term.clone(),
             vote_granted,
         };
-        
+        let persist_term = state.current_term.0;
+        let persist_vote = state.voted_for.as_ref().map(|n| n.0.clone());
+
         drop(state);
         drop(log);
-        
+
+        // Raft safety: a granted vote (or an advanced term) must be on durable storage
+        // before we tell the candidate, so a crash+restart never double-votes in a term.
+        if dirty {
+            self.persist_hard_state(persist_term, persist_vote).await;
+        }
+
         self.send_message(sender, response).await;
     }
     
@@ -210,9 +276,12 @@ impl RaftNode {
             state.current_term = term;
             state.state = RaftState::Follower;
             state.voted_for = None;
+            let persist_term = state.current_term.0;
+            drop(state);
+            self.persist_hard_state(persist_term, None).await;
             return;
         }
-        
+
         // Only process if we're a candidate in the same term
         if matches!(state.state, RaftState::Candidate) && term.0 == state.current_term.0 && vote_granted {
             // Record this peer's vote and count the distinct votes (including our own).
@@ -240,28 +309,36 @@ impl RaftNode {
         let mut log = self.log.write().await;
         
         let mut success = false;
-        
+        let mut dirty = false;
+
         // Update term if newer
         if term.0 > state.current_term.0 {
             state.current_term = term.clone();
             state.state = RaftState::Follower;
             state.voted_for = None;
+            dirty = true;
         }
-        
+
         // Accept leader if term is current
         if term.0 == state.current_term.0 {
             state.state = RaftState::Follower;
             state.leader_id = Some(leader_id);
             state.last_heartbeat = SystemTime::now();
-            
+
             // Check log consistency
-            if prev_log_index == 0 || 
-               (prev_log_index <= log.last_log_index() && 
+            if prev_log_index == 0 ||
+               (prev_log_index <= log.last_log_index() &&
                 log.get_term(prev_log_index).map_or(false, |t| t.0 == prev_log_term.0)) {
-                
-                // Append entries
-                success = log.append_entries(prev_log_index, entries);
-                
+
+                // Append entries — persisted durably inside append_entries before success.
+                success = match log.append_entries(prev_log_index, entries) {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        tracing::error!(error = %e, "follower failed to persist appended entries");
+                        false
+                    }
+                };
+
                 if success {
                     // Update commit index
                     let new_commit_index = std::cmp::min(leader_commit, log.last_log_index());
@@ -269,15 +346,22 @@ impl RaftNode {
                 }
             }
         }
-        
+
         let response = ConsensusMessage::AppendEntriesResponse {
             term: state.current_term.clone(),
             success,
             match_index: if success { log.last_log_index() } else { 0 },
         };
+        let persist_term = state.current_term.0;
+        let persist_vote = state.voted_for.as_ref().map(|n| n.0.clone());
 
         drop(state);
         drop(log);
+
+        // Persist an advanced term before acknowledging the leader.
+        if dirty {
+            self.persist_hard_state(persist_term, persist_vote).await;
+        }
 
         // If the leader advanced our commit index, apply the newly-committed entries
         // to our local state machine so this follower stays consistent with the leader.
@@ -296,9 +380,12 @@ impl RaftNode {
             state.current_term = term;
             state.state = RaftState::Follower;
             state.voted_for = None;
+            let persist_term = state.current_term.0;
+            drop(state);
+            self.persist_hard_state(persist_term, None).await;
             return;
         }
-        
+
         // Only process if we're the leader
         if !matches!(state.state, RaftState::Leader) || term.0 != state.current_term.0 {
             return;
@@ -347,7 +434,8 @@ impl RaftNode {
             }
         };
 
-        // Append the entry to the leader's log.
+        // Append the entry to the leader's log (persisted durably before it counts
+        // toward commitment).
         {
             let mut log = self.log.write().await;
             let state = self.state.read().await;
@@ -357,7 +445,8 @@ impl RaftNode {
                 log_operation,
                 request_id,
             );
-            log.append(entry);
+            drop(state);
+            log.append(entry)?;
         }
 
         // Register a waiter that apply_committed() will signal once this entry commits.
@@ -416,10 +505,16 @@ impl RaftNode {
             votes.insert(self.config.node_id.clone());
         }
 
+        let persist_term = state.current_term.0;
+        let self_id = self.config.node_id.0.clone();
+
         // A single-node cluster wins its own election immediately.
         if self.config.majority() <= 1 {
             state.become_leader(self.config.node_id.clone());
             drop(state);
+            drop(log);
+            // Durably record the new term + self-vote even in single-node mode.
+            self.persist_hard_state(persist_term, Some(self_id)).await;
             self.initialize_leader_state().await;
             return;
         }
@@ -430,10 +525,14 @@ impl RaftNode {
             last_log_index: log.last_log_index(),
             last_log_term: log.last_log_term(),
         };
-        
+
         drop(state);
         drop(log);
-        
+
+        // Raft safety: persist the incremented term and self-vote before soliciting
+        // votes, so a crash+restart cannot vote again in this term.
+        self.persist_hard_state(persist_term, Some(self_id)).await;
+
         // Send vote requests to all peers
         for peer_id in self.config.peers.keys() {
             self.send_message(peer_id.clone(), request.clone()).await;
@@ -630,6 +729,7 @@ impl Clone for RaftNode {
             transport: self.transport.clone(),
             state_machine: self.state_machine.clone(),
             votes_received: self.votes_received.clone(),
+            hard_state_store: self.hard_state_store.clone(),
         }
     }
 }

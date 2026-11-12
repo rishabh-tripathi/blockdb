@@ -6,6 +6,7 @@ use crate::auth::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -37,6 +38,15 @@ impl Default for AuthConfig {
     }
 }
 
+/// On-disk snapshot of the durable auth state (identities + permissions). Sessions
+/// and nonces are intentionally excluded — they are ephemeral by design.
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthSnapshot {
+    identity_chain: IdentityChain,
+    user_permissions: HashMap<UserId, PermissionSet>,
+    permission_operations: Vec<PermissionOperation>,
+}
+
 #[derive(Debug)]
 pub struct AuthManager {
     config: AuthConfig,
@@ -45,6 +55,9 @@ pub struct AuthManager {
     active_sessions: Arc<RwLock<HashMap<SessionId, AuthContext>>>,
     permission_operations: Arc<RwLock<Vec<PermissionOperation>>>,
     nonce_tracker: Arc<RwLock<HashMap<UserId, u64>>>,
+    /// When set, durable auth state is persisted here after every change, so user
+    /// accounts and permissions survive a restart (and admin keys stay stable).
+    persist_path: Option<PathBuf>,
 }
 
 impl AuthManager {
@@ -56,6 +69,7 @@ impl AuthManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             permission_operations: Arc::new(RwLock::new(Vec::new())),
             nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
+            persist_path: None,
         };
 
         // Initialize default admin user if configured
@@ -68,6 +82,87 @@ impl AuthManager {
         }
 
         auth_manager
+    }
+
+    /// Create an auth manager whose durable state is persisted under `dir`. If a
+    /// snapshot already exists it is loaded (and the default admin is *not*
+    /// recreated, so its keys and any password change persist); otherwise the
+    /// manager is initialized fresh and the initial state is written.
+    pub fn new_persistent(config: AuthConfig, dir: &std::path::Path) -> Self {
+        let path = dir.join("auth_state.bin");
+
+        if path.exists() {
+            match Self::load_snapshot(&path) {
+                Ok(snapshot) => {
+                    return Self {
+                        config,
+                        identity_chain: Arc::new(RwLock::new(snapshot.identity_chain)),
+                        user_permissions: Arc::new(RwLock::new(snapshot.user_permissions)),
+                        active_sessions: Arc::new(RwLock::new(HashMap::new())),
+                        permission_operations: Arc::new(RwLock::new(
+                            snapshot.permission_operations,
+                        )),
+                        nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
+                        persist_path: Some(path),
+                    };
+                }
+                Err(e) => {
+                    eprintln!("failed to load auth state from {:?}: {}; reinitializing", path, e);
+                }
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let auth_manager = Self {
+            config,
+            identity_chain: Arc::new(RwLock::new(IdentityChain::new())),
+            user_permissions: Arc::new(RwLock::new(HashMap::new())),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            permission_operations: Arc::new(RwLock::new(Vec::new())),
+            nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
+            persist_path: Some(path),
+        };
+        if !auth_manager.config.admin_users.is_empty() {
+            for admin_user in &auth_manager.config.admin_users.clone() {
+                if let Err(e) = auth_manager.create_admin_user(admin_user.clone(), "admin123") {
+                    eprintln!("Failed to create admin user {}: {}", admin_user, e);
+                }
+            }
+        }
+        auth_manager.persist();
+        auth_manager
+    }
+
+    fn load_snapshot(path: &std::path::Path) -> Result<AuthSnapshot, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(path)?;
+        Ok(bincode::deserialize(&bytes)?)
+    }
+
+    /// Durably write the current identities + permissions. No-op when not persistent.
+    /// Clones under read locks then writes outside them (atomic temp-file + rename).
+    fn persist(&self) {
+        let path = match &self.persist_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let snapshot = AuthSnapshot {
+            identity_chain: self.identity_chain.read().unwrap().clone(),
+            user_permissions: self.user_permissions.read().unwrap().clone(),
+            permission_operations: self.permission_operations.read().unwrap().clone(),
+        };
+        let bytes = match bincode::serialize(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("failed to serialize auth state: {}", e);
+                return;
+            }
+        };
+        let tmp = path.with_extension("bin.tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
+            eprintln!("failed to persist auth state to {:?}: {}", path, e);
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -117,6 +212,7 @@ impl AuthManager {
             user_perms.insert(user_id, permissions);
         }
 
+        self.persist();
         Ok(keypair)
     }
 
@@ -289,6 +385,7 @@ impl AuthManager {
             ops.push(operation);
         }
 
+        self.persist();
         Ok(())
     }
 
@@ -327,6 +424,7 @@ impl AuthManager {
             ops.push(operation);
         }
 
+        self.persist();
         Ok(())
     }
 
@@ -410,5 +508,69 @@ impl AuthManager {
         }
 
         Ok(())
+    }
+}
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use crate::auth::permissions::PermissionSet;
+
+    fn test_config() -> AuthConfig {
+        AuthConfig {
+            require_strong_passwords: false,
+            password_min_length: 4,
+            admin_users: vec!["admin".to_string()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn auth_state_survives_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // First instance: create a user and grant it a permission.
+        let admin_pubkey = {
+            let mgr = AuthManager::new_persistent(test_config(), dir.path());
+            mgr.create_user(
+                "alice".to_string(),
+                "Password1!",
+                PermissionSet::read_write(),
+                Some("admin".to_string()),
+                1,
+            )
+            .unwrap();
+            // Capture the admin identity's public key to prove it is NOT regenerated.
+            let chain = mgr.identity_chain.read().unwrap();
+            chain.find_identity("admin").unwrap().public_key.clone()
+        };
+
+        // Second instance on the same directory: state must be reloaded.
+        let mgr2 = AuthManager::new_persistent(test_config(), dir.path());
+
+        // The created user still exists and can authenticate with their password.
+        assert!(
+            mgr2.authenticate("alice", "Password1!").is_ok(),
+            "user did not survive restart"
+        );
+        assert!(
+            mgr2.get_user_permissions("alice").is_ok(),
+            "permissions did not survive restart"
+        );
+
+        // The admin was reloaded, not recreated with fresh keys.
+        let chain = mgr2.identity_chain.read().unwrap();
+        let admin_pubkey2 = chain.find_identity("admin").unwrap().public_key.clone();
+        assert_eq!(
+            admin_pubkey, admin_pubkey2,
+            "admin identity was regenerated instead of reloaded"
+        );
+    }
+
+    #[test]
+    fn non_persistent_manager_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _mgr = AuthManager::new(test_config());
+        // new() must not touch disk.
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 }

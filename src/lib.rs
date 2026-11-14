@@ -8,6 +8,7 @@ pub mod auth;
 pub mod consent;
 pub mod gdpr;
 pub mod audit;
+pub mod backup;
 pub mod cluster;
 
 pub use storage::{BlockDB, BlockDBConfig, Record};

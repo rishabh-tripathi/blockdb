@@ -83,6 +83,18 @@ pub struct ConsentWriteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddNodeRequest {
+    pub node_id: String,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveNodeRequest {
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterStatus {
     pub node_id: String,
     pub is_leader: bool,
@@ -639,8 +651,11 @@ impl ClusterNode {
         // left open so load balancers and scrapers can probe without a credential.
         // Client data paths (`/kv`, `/consent/*`) require the API token.
         let is_client_path = path == "/kv" || path.starts_with("/kv/") || path.starts_with("/consent");
+        let is_admin_path = path.starts_with("/cluster/");
         let auth = match (&method, path.as_str()) {
             (&Method::POST, "/raft/message") => self.check_cluster_auth(&req),
+            // Cluster membership administration is gated by the inter-node secret.
+            _ if is_admin_path => self.check_cluster_auth(&req),
             _ if is_client_path => self.check_client_auth(&req),
             _ => Ok(()),
         };
@@ -661,6 +676,8 @@ impl ClusterNode {
                 (&Method::GET, "/consent/history") => self.handle_consent_history(&query).await,
                 (&Method::GET, "/consent/list") => self.handle_consent_list(&query).await,
                 (&Method::GET, "/consent/export") => self.handle_consent_export(&query).await,
+                (&Method::POST, "/cluster/add-node") => self.handle_add_node(req).await,
+                (&Method::POST, "/cluster/remove-node") => self.handle_remove_node(req).await,
                 (&Method::GET, "/status") => self.handle_status().await,
                 (&Method::GET, "/health") => self.handle_health().await,
                 (&Method::GET, "/metrics") => Ok(self.handle_metrics().await),
@@ -850,6 +867,26 @@ impl ClusterNode {
             .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
         let states = self.consent_list(&subject).await?;
         Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "states": states})))
+    }
+
+    async fn handle_add_node(&self, req: Request<Body>) -> Result<Response<Body>, BlockDBError> {
+        let bytes = hyper::body::to_bytes(req.into_body())
+            .await
+            .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
+        let r: AddNodeRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| BlockDBError::InvalidData(format!("bad add-node request: {}", e)))?;
+        self.add_node(&r.node_id, &r.host, r.port).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "added": r.node_id})))
+    }
+
+    async fn handle_remove_node(&self, req: Request<Body>) -> Result<Response<Body>, BlockDBError> {
+        let bytes = hyper::body::to_bytes(req.into_body())
+            .await
+            .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
+        let r: RemoveNodeRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| BlockDBError::InvalidData(format!("bad remove-node request: {}", e)))?;
+        self.remove_node(&r.node_id).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "removed": r.node_id})))
     }
 
     async fn handle_consent_export(&self, query: &str) -> Result<Response<Body>, BlockDBError> {

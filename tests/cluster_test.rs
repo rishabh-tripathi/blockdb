@@ -436,3 +436,28 @@ async fn test_consent_endpoints_over_http() {
     let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(v["state"]["status"], "Granted");
 }
+
+#[tokio::test]
+async fn test_admin_add_node_endpoint_requires_cluster_secret() {
+    let security = ClusterSecurity {
+        cluster_secret: Some("adminsecret".to_string()),
+        api_token: None,
+        tls: None,
+    };
+    let cluster = spawn_cluster_secure(1, security).await;
+    let _ = wait_for_leader(&cluster).await;
+    let port = cluster.ports[0];
+
+    let body = r#"{"node_id":"node9","host":"127.0.0.1","port":19999}"#;
+    // Without the cluster secret -> 401.
+    assert_eq!(
+        post(port, "/cluster/add-node", body, None, None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // With the correct secret -> accepted (the membership change commits under the
+    // single-node majority).
+    assert_eq!(
+        post(port, "/cluster/add-node", body, None, Some("adminsecret")).await,
+        StatusCode::OK
+    );
+}

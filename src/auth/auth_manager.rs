@@ -57,6 +57,8 @@ pub struct AuthManager {
     /// When set, durable auth state is persisted here after every change, so user
     /// accounts and permissions survive a restart (and admin keys stay stable).
     persist_path: Option<PathBuf>,
+    /// Optional tamper-evident audit sink for auth/permission events.
+    audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl AuthManager {
@@ -69,6 +71,7 @@ impl AuthManager {
             permission_operations: Arc::new(RwLock::new(Vec::new())),
             nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
             persist_path: None,
+            audit: None,
         };
 
         // Seed any configured admin users with a generated strong password (logged
@@ -98,6 +101,7 @@ impl AuthManager {
                         )),
                         nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
                         persist_path: Some(path),
+            audit: None,
                     };
                 }
                 Err(e) => {
@@ -117,6 +121,7 @@ impl AuthManager {
             permission_operations: Arc::new(RwLock::new(Vec::new())),
             nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
             persist_path: Some(path),
+            audit: None,
         };
         auth_manager.seed_configured_admins();
         auth_manager.persist();
@@ -246,7 +251,40 @@ impl AuthManager {
         self.create_user(user_id, password, PermissionSet::admin(), None, 0)
     }
 
+    /// Attach a tamper-evident audit sink. Call before sharing the manager.
+    pub fn attach_audit_log(&mut self, log: Arc<crate::audit::AuditLog>) {
+        self.audit = Some(log);
+    }
+
+    fn audit(
+        &self,
+        action: &str,
+        actor: Option<&str>,
+        target: Option<&str>,
+        outcome: crate::audit::Outcome,
+        detail: Option<&str>,
+    ) {
+        if let Some(log) = &self.audit {
+            log.log(action, actor, target, outcome, detail);
+        }
+    }
+
     pub fn authenticate(&self, user_id: &str, password: &str) -> Result<AuthContext, AuthError> {
+        let result = self.authenticate_inner(user_id, password);
+        match &result {
+            Ok(_) => self.audit("auth.login", Some(user_id), None, crate::audit::Outcome::Success, None),
+            Err(e) => self.audit(
+                "auth.login",
+                Some(user_id),
+                None,
+                crate::audit::Outcome::Failure,
+                Some(&e.to_string()),
+            ),
+        }
+        result
+    }
+
+    fn authenticate_inner(&self, user_id: &str, password: &str) -> Result<AuthContext, AuthError> {
         if !self.is_enabled() {
             return Err(AuthError::CryptographicError("Authentication is disabled".to_string()));
         }
@@ -385,6 +423,7 @@ impl AuthManager {
                 .ok_or_else(|| AuthError::UserNotFound(target_user.to_string()))?;
         }
 
+        let perm_desc = format!("{:?}", permission);
         // Grant permission
         {
             let mut user_perms = self.user_permissions.write().unwrap();
@@ -412,6 +451,13 @@ impl AuthManager {
         }
 
         self.persist();
+        self.audit(
+            "permission.grant",
+            Some(granted_by),
+            Some(target_user),
+            crate::audit::Outcome::Success,
+            Some(&perm_desc),
+        );
         Ok(())
     }
 
@@ -451,6 +497,13 @@ impl AuthManager {
         }
 
         self.persist();
+        self.audit(
+            "permission.revoke",
+            Some(revoked_by),
+            Some(target_user),
+            crate::audit::Outcome::Success,
+            Some(&format!("{:?}", permission)),
+        );
         Ok(())
     }
 
@@ -619,6 +672,30 @@ mod persistence_tests {
             admin_pubkey, admin_pubkey2,
             "admin identity was regenerated instead of reloaded"
         );
+    }
+
+    #[test]
+    fn auth_events_are_audited() {
+        use crate::audit::AuditLog;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = AuthManager::new(AuthConfig { admin_users: vec![], ..Default::default() });
+        let log = std::sync::Arc::new(AuditLog::open(dir.path()).unwrap());
+        mgr.attach_audit_log(log.clone());
+
+        let pw = generate_secure_password();
+        mgr.create_user("zoe".into(), &pw, PermissionSet::read_only(), None, 0).unwrap();
+
+        assert!(mgr.authenticate("zoe", "wrong").is_err());
+        assert!(mgr.authenticate("zoe", &pw).is_ok());
+
+        let events = log.events().unwrap();
+        // One failed + one successful login recorded.
+        let logins: Vec<_> = events.iter().filter(|e| e.action == "auth.login").collect();
+        assert_eq!(logins.len(), 2);
+        assert_eq!(logins[0].outcome, crate::audit::Outcome::Failure);
+        assert_eq!(logins[1].outcome, crate::audit::Outcome::Success);
+        // The tamper-evident chain verifies.
+        assert_eq!(log.verify().unwrap(), events.len());
     }
 
     #[test]

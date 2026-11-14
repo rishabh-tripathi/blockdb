@@ -116,7 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             admin_users: vec![],
             ..AuthConfig::default()
         };
-        let am = AuthManager::new_persistent(auth_config, &auth_dir);
+        let mut am = AuthManager::new_persistent(auth_config, &auth_dir);
+        // Attach a tamper-evident audit log for auth and permission events.
+        match blockdb::audit::AuditLog::open(&auth_dir) {
+            Ok(log) => am.attach_audit_log(std::sync::Arc::new(log)),
+            Err(e) => tracing::warn!(error = %e, "could not open audit log; auditing disabled"),
+        }
         match (
             std::env::var("BLOCKDB_ADMIN_USER"),
             std::env::var("BLOCKDB_ADMIN_PASSWORD"),

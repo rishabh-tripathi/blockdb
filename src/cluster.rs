@@ -174,6 +174,8 @@ pub struct ClusterNode {
     start_time: Instant,
     /// Pooled HTTP client reused for leader-forwarding (reads and writes).
     http: Client<hyper::client::HttpConnector>,
+    /// Tamper-evident audit log for membership and other security events.
+    audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl ClusterNode {
@@ -231,6 +233,9 @@ impl ClusterNode {
                 .pool_idle_timeout(Duration::from_secs(30))
                 .pool_max_idle_per_host(8)
                 .build_http(),
+            audit: crate::audit::AuditLog::open(&data_dir.join("audit"))
+                .map(Arc::new)
+                .ok(),
         }))
     }
 
@@ -506,20 +511,36 @@ impl ClusterNode {
     /// Add a node to the cluster at runtime (leader-only; replicated through the log).
     pub async fn add_node(&self, node_id: &str, host: &str, port: u16) -> Result<(), BlockDBError> {
         use crate::consensus::ConsensusEngine;
-        self.raft
+        let result = self
+            .raft
             .add_node(
                 NodeId::from_string(node_id.to_string()),
                 NodeAddress::new(host.to_string(), port),
             )
-            .await
+            .await;
+        self.audit_membership("cluster.add_node", node_id, &format!("{}:{}", host, port), &result);
+        result
     }
 
     /// Remove a node from the cluster at runtime (leader-only; replicated through the log).
     pub async fn remove_node(&self, node_id: &str) -> Result<(), BlockDBError> {
         use crate::consensus::ConsensusEngine;
-        self.raft
+        let result = self
+            .raft
             .remove_node(&NodeId::from_string(node_id.to_string()))
-            .await
+            .await;
+        self.audit_membership("cluster.remove_node", node_id, "", &result);
+        result
+    }
+
+    fn audit_membership(&self, action: &str, target: &str, detail: &str, result: &Result<(), BlockDBError>) {
+        if let Some(log) = &self.audit {
+            let (outcome, d) = match result {
+                Ok(()) => (crate::audit::Outcome::Success, detail.to_string()),
+                Err(e) => (crate::audit::Outcome::Failure, e.to_string()),
+            };
+            log.log(action, Some(&self.node_id.0), Some(target), outcome, Some(&d));
+        }
     }
 
     async fn forward_write(

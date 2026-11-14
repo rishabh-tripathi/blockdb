@@ -66,11 +66,23 @@ fn start_one_timed(
     heartbeat_ms: u64,
     election_ms: u64,
 ) -> RunningNode {
+    start_one_full(id, port, peers, data_dir, heartbeat_ms, election_ms, 10_000)
+}
+
+fn start_one_full(
+    id: &str,
+    port: u16,
+    peers: &[(String, String, u16)],
+    data_dir: &Path,
+    heartbeat_ms: u64,
+    election_ms: u64,
+    compaction_retention: u64,
+) -> RunningNode {
     let storage_config = BlockDBConfig {
         data_dir: data_dir.to_string_lossy().to_string(),
         ..Default::default()
     };
-    let cluster_config = build_cluster_config(
+    let mut cluster_config = build_cluster_config(
         id,
         "127.0.0.1",
         port,
@@ -78,6 +90,7 @@ fn start_one_timed(
         Duration::from_millis(heartbeat_ms),
         Duration::from_millis(election_ms),
     );
+    cluster_config.compaction_retention = compaction_retention;
     let node = ClusterNode::new(cluster_config, storage_config).unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     let n = node.clone();
@@ -343,6 +356,68 @@ async fn test_remove_node_from_live_cluster() {
             );
         }
     }
+
+    for slot in nodes.into_iter().flatten() {
+        slot.crash().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_lagging_follower_catches_up_via_snapshot() {
+    // Aggressive compaction (retention 4) so the leader quickly compacts past a
+    // follower that was offline, forcing an InstallSnapshot to catch it up.
+    let size = 3;
+    let base = NEXT_PORT.fetch_add(size as u16, Ordering::SeqCst);
+    let peers = peer_list(size, base);
+    let dirs: Vec<TempDir> = (0..size).map(|_| TempDir::new().unwrap()).collect();
+
+    let mut nodes: Vec<Option<RunningNode>> = (0..size)
+        .map(|i| Some(start_one_full(&format!("node{}", i), base + i as u16, &peers, dirs[i].path(), 40, 150, 4)))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let leader = wait_any_leader(&nodes).await.expect("no leader");
+    let leader_node = nodes[leader].as_ref().unwrap().node.clone();
+
+    // A couple of early writes the whole cluster sees.
+    leader_node.put(b"snap0", b"v0").await.unwrap();
+    leader_node.put(b"snap1", b"v1").await.unwrap();
+
+    // Crash a follower (keep its data dir).
+    let follower = (leader + 1) % size;
+    nodes[follower].take().unwrap().crash().await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Write many entries while the follower is down — enough that the leader compacts
+    // its log well past the follower's last index (majority of 2 still commits).
+    for i in 2..40 {
+        leader_node
+            .put(format!("snap{}", i).as_bytes(), format!("v{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+    assert!(
+        wait_for_value(&leader_node, b"snap39", b"v39").await,
+        "leader did not commit the bulk writes"
+    );
+
+    // Restart the follower. Its log is far below the leader's compaction baseline, so
+    // normal AppendEntries can't serve it — it must be caught up via InstallSnapshot.
+    let rejoined = start_one_full(
+        &format!("node{}", follower),
+        base + follower as u16,
+        &peers,
+        dirs[follower].path(),
+        40,
+        150,
+        4,
+    );
+    assert!(
+        wait_for_value(&rejoined.node, b"snap39", b"v39").await,
+        "follower did not catch up via snapshot"
+    );
+    // And it has the early data too (full snapshot install).
+    assert_eq!(rejoined.node.get(b"snap0").await.unwrap(), Some(b"v0".to_vec()));
+    nodes[follower] = Some(rejoined);
 
     for slot in nodes.into_iter().flatten() {
         slot.crash().await;

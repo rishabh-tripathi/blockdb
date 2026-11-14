@@ -1,4 +1,4 @@
-use crate::auth::{AuthError, PrivateKey, PublicKey, Signature, UserId};
+use crate::auth::{AuthError, PrivateKey, PublicKey, Signature};
 use base64::Engine;
 use ed25519_dalek::{Keypair, PublicKey as Ed25519PublicKey, SecretKey, Signature as Ed25519Signature, Signer, Verifier};
 use rand::rngs::OsRng;

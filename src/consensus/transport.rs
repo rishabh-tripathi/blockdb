@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use hyper::client::HttpConnector;
 use hyper::{Body, Client, Request};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
@@ -49,6 +50,16 @@ pub struct HttpRaftTransport {
     /// Pre-shared secret attached to every outbound Raft RPC so peers can reject
     /// forged consensus messages. `None` = unauthenticated (dev/single-node).
     cluster_secret: Option<String>,
+    /// A single pooled client reused for every peer, so Raft RPCs ride on kept-alive
+    /// connections instead of a fresh TCP+handshake per heartbeat.
+    client: Client<HttpConnector>,
+}
+
+fn pooled_client() -> Client<HttpConnector> {
+    Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
+        .build_http()
 }
 
 impl HttpRaftTransport {
@@ -56,6 +67,7 @@ impl HttpRaftTransport {
         HttpRaftTransport {
             timeout: Duration::from_millis(500),
             cluster_secret: None,
+            client: pooled_client(),
         }
     }
 
@@ -63,6 +75,7 @@ impl HttpRaftTransport {
         HttpRaftTransport {
             timeout,
             cluster_secret: None,
+            client: pooled_client(),
         }
     }
 
@@ -71,6 +84,7 @@ impl HttpRaftTransport {
         HttpRaftTransport {
             timeout,
             cluster_secret,
+            client: pooled_client(),
         }
     }
 }
@@ -99,8 +113,7 @@ impl RaftTransport for HttpRaftTransport {
             Err(_) => return,
         };
 
-        let client = Client::new();
         // Best-effort: a timeout or connection error is fine — Raft retries.
-        let _ = timeout(self.timeout, client.request(req)).await;
+        let _ = timeout(self.timeout, self.client.request(req)).await;
     }
 }

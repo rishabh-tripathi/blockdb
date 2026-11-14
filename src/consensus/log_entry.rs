@@ -267,6 +267,24 @@ impl ReplicatedLog {
         self.get_term(index)
     }
 
+    /// Install a received snapshot: discard the entire in-memory/on-disk log and set the
+    /// baseline to `(base_index, base_term)`. Used by a follower that got an
+    /// InstallSnapshot because it had fallen below the leader's log. Commit/applied are
+    /// set to the baseline (everything up to it is now durable in the state machine).
+    pub fn install_snapshot(&mut self, base_index: u64, base_term: Term) -> Result<(), BlockDBError> {
+        self.entries.clear();
+        self.base_index = base_index;
+        self.base_term = base_term;
+        self.commit_index = base_index;
+        self.last_applied = base_index;
+        if let Some(store) = self.store.as_mut() {
+            store.rewrite(&[]).map_err(|e| {
+                BlockDBError::ConsensusError(format!("install snapshot persist failed: {}", e))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Whether the log has grown enough past the retention tail to be worth compacting,
     /// and the index to compact up to if so.
     pub fn compaction_target(&self) -> Option<u64> {
@@ -391,6 +409,29 @@ mod compaction_tests {
         // prev_log_index at the current tail appends fine.
         assert_eq!(log.append_entries(8, vec![e(9, 1)]).unwrap(), true);
         assert_eq!(log.get_entry(9).unwrap().index, 9);
+    }
+
+    #[test]
+    fn install_snapshot_resets_log_to_baseline() {
+        let mut log = ReplicatedLog::new();
+        for i in 1..=5 {
+            log.append(e(i, 1)).unwrap();
+        }
+        log.update_commit_index(5);
+        log.apply_up_to(5);
+
+        // A follower installs a snapshot taken at index 100, term 7.
+        log.install_snapshot(100, Term(7)).unwrap();
+        assert_eq!(log.base_index(), 100);
+        assert_eq!(log.last_log_index(), 100, "log is empty above the new baseline");
+        assert_eq!(log.get_commit_index(), 100);
+        assert_eq!(log.get_term(100).map(|t| t.0), Some(7));
+        assert!(log.get_entry(50).is_none());
+
+        // New entries append above the installed baseline.
+        log.append_entries(100, vec![e(101, 7)]).unwrap();
+        assert_eq!(log.last_log_index(), 101);
+        assert_eq!(log.get_entry(101).unwrap().index, 101);
     }
 
     #[test]

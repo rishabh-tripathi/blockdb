@@ -2,8 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::Mutex;
-use uuid::Uuid;
 
 use crate::consensus::{NodeId, NodeAddress, ClusterConfig, ConsensusEngine};
 use crate::consensus::raft::RaftNode;
@@ -232,7 +230,7 @@ impl DistributedBlockDB {
         self.consensus.add_node(node_id.clone(), address.clone()).await?;
         
         // Update 2PC coordinator if transactions are enabled
-        if let Some(ref coordinator) = self.two_pc_coordinator {
+        if let Some(_coordinator) = &self.two_pc_coordinator {
             // In a complete implementation, we would update the participant list
             // to include the new node for distributed transactions
         }
@@ -245,7 +243,7 @@ impl DistributedBlockDB {
         self.consensus.remove_node(node_id).await?;
         
         // Update 2PC coordinator if transactions are enabled
-        if let Some(ref coordinator) = self.two_pc_coordinator {
+        if let Some(_coordinator) = &self.two_pc_coordinator {
             // In a complete implementation, we would update the participant list
             // to remove the node from distributed transactions
         }

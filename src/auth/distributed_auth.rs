@@ -5,7 +5,6 @@ use crate::error::BlockDBError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 
 // Extended configuration that includes authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +103,7 @@ impl AuthenticatedDistributedBlockDB {
                 peers,
                 heartbeat_interval: std::time::Duration::from_millis(config.cluster.heartbeat_interval_ms),
                 election_timeout: std::time::Duration::from_millis(config.cluster.election_timeout_ms),
+                compaction_retention: 10_000,
             },
             enable_transactions: config.cluster.enable_transactions,
             transaction_timeout: std::time::Duration::from_secs(config.cluster.transaction_timeout_secs),
@@ -292,7 +292,7 @@ impl AuthenticatedDistributedBlockDB {
 
     pub async fn authenticated_delete(
         &self,
-        key: &[u8],
+        _key: &[u8],
         auth_context: &AuthContext,
     ) -> Result<(), BlockDBError> {
         if let Some(auth_manager) = &self.auth_manager {

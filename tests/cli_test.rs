@@ -1,6 +1,5 @@
 use std::process::Command;
 use tempfile::TempDir;
-use serde_json::Value;
 use base64::Engine;
 
 /// CLI integration tests

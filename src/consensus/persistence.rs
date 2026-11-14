@@ -147,6 +147,8 @@ impl HardStateStore {
 /// (Raft §5.3) rewrites the file with the surviving prefix.
 #[derive(Debug)]
 pub struct LogStore {
+    /// Retained for diagnostics/error context; I/O goes through `file`.
+    #[allow(dead_code)]
     path: PathBuf,
     file: File,
 }

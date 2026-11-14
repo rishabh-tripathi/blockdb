@@ -29,6 +29,7 @@ use crate::consensus::log_entry::{LogEntry, LogOperation};
 use crate::consensus::raft::RaftNode;
 use crate::consensus::transport::{HttpRaftTransport, RaftEnvelope, CLUSTER_AUTH_HEADER};
 use crate::consensus::{ClusterConfig, ConsensusEngine, NodeAddress, NodeId, StateMachine};
+use crate::consent::{ConsentEvent, ConsentState, ConsentStatus, ConsentStore};
 use crate::error::BlockDBError;
 use crate::storage::BlockDBConfig;
 use crate::transaction::Operation;
@@ -49,6 +50,33 @@ impl StateMachine for BlockDBStateMachine {
             _ => Ok(()),
         }
     }
+
+    /// Serialize the full committed key/value state for InstallSnapshot transfer.
+    async fn snapshot(&self) -> Result<Vec<u8>, BlockDBError> {
+        let all = self.db.scan_prefix(b"").await?;
+        bincode::serialize(&all)
+            .map_err(|e| BlockDBError::SerializationError(e))
+    }
+
+    /// Install a received snapshot by applying every key/value. The store is
+    /// append-only, so keys we already hold are rejected as duplicates and skipped —
+    /// the merge is idempotent and converges on the leader's state.
+    async fn restore(&self, data: &[u8]) -> Result<(), BlockDBError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = bincode::deserialize(data)
+            .map_err(|e| BlockDBError::SerializationError(e))?;
+        for (k, v) in pairs {
+            match self.db.put(&k, &v).await {
+                Ok(()) => {}
+                // A key we already have (same committed value) is fine.
+                Err(BlockDBError::DuplicateKey(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +96,29 @@ pub struct KvReadResponse {
     pub success: bool,
     pub found: bool,
     pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsentWriteRequest {
+    pub subject_id: String,
+    pub purpose: String,
+    #[serde(default)]
+    pub metadata: Option<std::collections::BTreeMap<String, String>>,
+    /// Optional consent expiry (epoch ms); applies to grants only.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddNodeRequest {
+    pub node_id: String,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveNodeRequest {
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +211,10 @@ pub struct ClusterNode {
     security: ClusterSecurity,
     metrics: Arc<ClusterMetrics>,
     start_time: Instant,
+    /// Pooled HTTP client reused for leader-forwarding (reads and writes).
+    http: Client<hyper::client::HttpConnector>,
+    /// Tamper-evident audit log for membership and other security events.
+    audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl ClusterNode {
@@ -213,6 +268,13 @@ impl ClusterNode {
             security,
             metrics: Arc::new(ClusterMetrics::default()),
             start_time: Instant::now(),
+            http: Client::builder()
+                .pool_idle_timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(8)
+                .build_http(),
+            audit: crate::audit::AuditLog::open(&data_dir.join("audit"))
+                .map(Arc::new)
+                .ok(),
         }))
     }
 
@@ -379,6 +441,105 @@ impl ClusterNode {
         self.raft.is_leader().await
     }
 
+    // ---- Consent API (replicated) ----
+
+    /// Record a consent grant, replicated through Raft. The event is built once here
+    /// (id, timestamp, proof hash) and the resulting key/value is driven through
+    /// consensus, so every node applies identical bytes.
+    pub async fn consent_grant(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        metadata: std::collections::BTreeMap<String, String>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        self.record_consent(subject_id, purpose, ConsentStatus::Granted, metadata, None)
+            .await
+    }
+
+    /// Record a consent grant that expires at `expires_at_ms` (consent TTL).
+    pub async fn consent_grant_with_expiry(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        metadata: std::collections::BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        self.record_consent(subject_id, purpose, ConsentStatus::Granted, metadata, expires_at_ms)
+            .await
+    }
+
+    /// Record a consent withdrawal, replicated through Raft.
+    pub async fn consent_withdraw(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        metadata: std::collections::BTreeMap<String, String>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        self.record_consent(subject_id, purpose, ConsentStatus::Withdrawn, metadata, None)
+            .await
+    }
+
+    async fn record_consent(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        status: ConsentStatus,
+        metadata: std::collections::BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        let (key, value, event) =
+            ConsentStore::prepare_event(subject_id, purpose, status, metadata, expires_at_ms)?;
+        self.put(key.as_bytes(), &value).await?;
+        Ok(event)
+    }
+
+    /// Export a subject's full consent record (GDPR subject-access request).
+    pub async fn consent_export(
+        &self,
+        subject_id: &str,
+    ) -> Result<crate::consent::SubjectExport, BlockDBError> {
+        ConsentStore::new(self.storage.clone())
+            .export_subject(subject_id)
+            .await
+    }
+
+    /// Current consent state for a (subject, purpose), read from the local store.
+    pub async fn consent_status(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+    ) -> Result<Option<ConsentState>, BlockDBError> {
+        ConsentStore::new(self.storage.clone())
+            .status(subject_id, purpose)
+            .await
+    }
+
+    /// Full immutable consent history for a (subject, purpose).
+    pub async fn consent_history(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+    ) -> Result<Vec<ConsentEvent>, BlockDBError> {
+        ConsentStore::new(self.storage.clone())
+            .history(subject_id, purpose)
+            .await
+    }
+
+    /// Latest consent state per purpose for a subject.
+    pub async fn consent_list(
+        &self,
+        subject_id: &str,
+    ) -> Result<Vec<ConsentState>, BlockDBError> {
+        ConsentStore::new(self.storage.clone())
+            .list_for_subject(subject_id)
+            .await
+    }
+
+    /// Prefix scan over the local store (for the general single-write KV use case).
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BlockDBError> {
+        self.storage.scan_prefix(prefix).await
+    }
+
     /// Stop this node's consensus loop. Combined with resolving the `start` shutdown
     /// future (which stops the HTTP server), this fully quiesces the node — used to
     /// simulate a crash before restarting from the same data directory.
@@ -389,20 +550,36 @@ impl ClusterNode {
     /// Add a node to the cluster at runtime (leader-only; replicated through the log).
     pub async fn add_node(&self, node_id: &str, host: &str, port: u16) -> Result<(), BlockDBError> {
         use crate::consensus::ConsensusEngine;
-        self.raft
+        let result = self
+            .raft
             .add_node(
                 NodeId::from_string(node_id.to_string()),
                 NodeAddress::new(host.to_string(), port),
             )
-            .await
+            .await;
+        self.audit_membership("cluster.add_node", node_id, &format!("{}:{}", host, port), &result);
+        result
     }
 
     /// Remove a node from the cluster at runtime (leader-only; replicated through the log).
     pub async fn remove_node(&self, node_id: &str) -> Result<(), BlockDBError> {
         use crate::consensus::ConsensusEngine;
-        self.raft
+        let result = self
+            .raft
             .remove_node(&NodeId::from_string(node_id.to_string()))
-            .await
+            .await;
+        self.audit_membership("cluster.remove_node", node_id, "", &result);
+        result
+    }
+
+    fn audit_membership(&self, action: &str, target: &str, detail: &str, result: &Result<(), BlockDBError>) {
+        if let Some(log) = &self.audit {
+            let (outcome, d) = match result {
+                Ok(()) => (crate::audit::Outcome::Success, detail.to_string()),
+                Err(e) => (crate::audit::Outcome::Failure, e.to_string()),
+            };
+            log.log(action, Some(&self.node_id.0), Some(target), outcome, Some(&d));
+        }
     }
 
     async fn forward_write(
@@ -427,8 +604,7 @@ impl ClusterNode {
             .body(Body::from(body))
             .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
 
-        let client = Client::new();
-        let resp = tokio::time::timeout(self.forward_timeout, client.request(req))
+        let resp = tokio::time::timeout(self.forward_timeout, self.http.request(req))
             .await
             .map_err(|_| BlockDBError::ConsensusError("forward to leader timed out".to_string()))?
             .map_err(|e| BlockDBError::ConsensusError(format!("forward to leader failed: {}", e)))?;
@@ -467,8 +643,7 @@ impl ClusterNode {
             .body(Body::empty())
             .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
 
-        let client = Client::new();
-        let resp = tokio::time::timeout(self.forward_timeout, client.request(req))
+        let resp = tokio::time::timeout(self.forward_timeout, self.http.request(req))
             .await
             .map_err(|_| BlockDBError::ConsensusError("read forward to leader timed out".to_string()))?
             .map_err(|e| {
@@ -501,9 +676,14 @@ impl ClusterNode {
 
         // Authenticate before doing any work. `/status`, `/health` and `/metrics` are
         // left open so load balancers and scrapers can probe without a credential.
+        // Client data paths (`/kv`, `/consent/*`) require the API token.
+        let is_client_path = path == "/kv" || path.starts_with("/kv/") || path.starts_with("/consent");
+        let is_admin_path = path.starts_with("/cluster/");
         let auth = match (&method, path.as_str()) {
             (&Method::POST, "/raft/message") => self.check_cluster_auth(&req),
-            (_, "/kv") => self.check_client_auth(&req),
+            // Cluster membership administration is gated by the inter-node secret.
+            _ if is_admin_path => self.check_cluster_auth(&req),
+            _ if is_client_path => self.check_client_auth(&req),
             _ => Ok(()),
         };
 
@@ -516,6 +696,15 @@ impl ClusterNode {
                 (&Method::POST, "/raft/message") => self.handle_raft_message(req).await,
                 (&Method::POST, "/kv") => self.handle_kv_write(req).await,
                 (&Method::GET, "/kv") => self.handle_kv_read(&query).await,
+                (&Method::GET, "/kv/scan") => self.handle_scan(&query).await,
+                (&Method::POST, "/consent/grant") => self.handle_consent_write(req, true).await,
+                (&Method::POST, "/consent/withdraw") => self.handle_consent_write(req, false).await,
+                (&Method::GET, "/consent/status") => self.handle_consent_status(&query).await,
+                (&Method::GET, "/consent/history") => self.handle_consent_history(&query).await,
+                (&Method::GET, "/consent/list") => self.handle_consent_list(&query).await,
+                (&Method::GET, "/consent/export") => self.handle_consent_export(&query).await,
+                (&Method::POST, "/cluster/add-node") => self.handle_add_node(req).await,
+                (&Method::POST, "/cluster/remove-node") => self.handle_remove_node(req).await,
                 (&Method::GET, "/status") => self.handle_status().await,
                 (&Method::GET, "/health") => self.handle_health().await,
                 (&Method::GET, "/metrics") => Ok(self.handle_metrics().await),
@@ -632,6 +821,106 @@ impl ClusterNode {
                 value: value.map(|v| String::from_utf8_lossy(&v).to_string()),
             },
         ))
+    }
+
+    async fn handle_scan(&self, query: &str) -> Result<Response<Body>, BlockDBError> {
+        let prefix = query_param(query, "prefix").unwrap_or_default();
+        let limit = query_param(query, "limit")
+            .and_then(|l| l.parse::<usize>().ok())
+            .unwrap_or(1000)
+            .min(10_000);
+        self.metrics.kv_reads_total.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.scan_prefix(prefix.as_bytes()).await?;
+        entries.truncate(limit);
+        let items: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|(k, v)| {
+                serde_json::json!({
+                    "key": String::from_utf8_lossy(&k),
+                    "value": String::from_utf8_lossy(&v),
+                })
+            })
+            .collect();
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "count": items.len(), "items": items})))
+    }
+
+    async fn handle_consent_write(
+        &self,
+        req: Request<Body>,
+        grant: bool,
+    ) -> Result<Response<Body>, BlockDBError> {
+        let bytes = hyper::body::to_bytes(req.into_body())
+            .await
+            .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
+        let r: ConsentWriteRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| BlockDBError::InvalidData(format!("bad consent request: {}", e)))?;
+        let metadata = r.metadata.unwrap_or_default();
+        self.metrics.kv_writes_total.fetch_add(1, Ordering::Relaxed);
+        let event = if grant {
+            self.consent_grant_with_expiry(&r.subject_id, &r.purpose, metadata, r.expires_at_ms)
+                .await
+        } else {
+            self.consent_withdraw(&r.subject_id, &r.purpose, metadata).await
+        };
+        match event {
+            Ok(ev) => Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "event": ev}))),
+            Err(e) => {
+                self.metrics.write_errors_total.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    async fn handle_consent_status(&self, query: &str) -> Result<Response<Body>, BlockDBError> {
+        let subject = query_param(query, "subject")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
+        let purpose = query_param(query, "purpose")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'purpose'".to_string()))?;
+        let state = self.consent_status(&subject, &purpose).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "state": state})))
+    }
+
+    async fn handle_consent_history(&self, query: &str) -> Result<Response<Body>, BlockDBError> {
+        let subject = query_param(query, "subject")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
+        let purpose = query_param(query, "purpose")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'purpose'".to_string()))?;
+        let events = self.consent_history(&subject, &purpose).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "events": events})))
+    }
+
+    async fn handle_consent_list(&self, query: &str) -> Result<Response<Body>, BlockDBError> {
+        let subject = query_param(query, "subject")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
+        let states = self.consent_list(&subject).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "states": states})))
+    }
+
+    async fn handle_add_node(&self, req: Request<Body>) -> Result<Response<Body>, BlockDBError> {
+        let bytes = hyper::body::to_bytes(req.into_body())
+            .await
+            .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
+        let r: AddNodeRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| BlockDBError::InvalidData(format!("bad add-node request: {}", e)))?;
+        self.add_node(&r.node_id, &r.host, r.port).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "added": r.node_id})))
+    }
+
+    async fn handle_remove_node(&self, req: Request<Body>) -> Result<Response<Body>, BlockDBError> {
+        let bytes = hyper::body::to_bytes(req.into_body())
+            .await
+            .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
+        let r: RemoveNodeRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| BlockDBError::InvalidData(format!("bad remove-node request: {}", e)))?;
+        self.remove_node(&r.node_id).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "removed": r.node_id})))
+    }
+
+    async fn handle_consent_export(&self, query: &str) -> Result<Response<Body>, BlockDBError> {
+        let subject = query_param(query, "subject")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
+        let export = self.consent_export(&subject).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "export": export})))
     }
 
     async fn handle_status(&self) -> Result<Response<Body>, BlockDBError> {
@@ -776,6 +1065,15 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Extract and percent-decode a query parameter value by name.
+fn query_param(query: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}=", name);
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix(&prefix))
+        .map(urldecode)
 }
 
 /// Reverse of `urlencode`. Invalid escapes are passed through unchanged.

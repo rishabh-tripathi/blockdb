@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use dashmap::DashMap;
-use parking_lot::{RwLock, Mutex};
+use parking_lot::Mutex;
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 use crate::error::BlockDBError;
@@ -283,6 +283,8 @@ impl TransactionManager {
 #[derive(Debug)]
 pub struct TwoPhaseCommitCoordinator {
     transaction_manager: Arc<TransactionManager>,
+    /// Reserved for the in-progress 2PC participant coordination.
+    #[allow(dead_code)]
     participants: Vec<String>, // Node addresses
 }
 

@@ -1,0 +1,43 @@
+name: Formal (TLA+)
+
+# Model-checks the Raft consensus safety specification with TLC on every push,
+# so the safety invariants (ElectionSafety, LogMatching, StateMachineSafety) are
+# verified on a small finite instance, not just asserted.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "formal/**"
+      - ".github/workflows/formal.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "formal/**"
+      - ".github/workflows/formal.yml"
+  workflow_dispatch:
+
+jobs:
+  tlc:
+    name: Model-check Raft.tla
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download TLA+ tools
+        run: |
+          curl -sSL -o tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          java -cp tla2tools.jar tlc2.TLC -help | head -1
+
+      - name: Model-check safety invariants
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp ../tla2tools.jar tlc2.TLC \
+            -config MC_Raft.cfg -deadlock -workers auto Raft.tla

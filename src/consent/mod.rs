@@ -165,14 +165,71 @@ pub struct ConsentState {
 }
 
 /// High-level consent API backed by a `BlockDBHandle`.
+///
+/// When a `keyring` is configured, each event's value is stored encrypted under the
+/// subject's data key (crypto-shredding): erasing the subject destroys the key and
+/// renders every one of their events permanently unreadable, satisfying GDPR
+/// right-to-erasure on the append-only store. Without a keyring, events are stored in
+/// plaintext (the historical behavior).
 #[derive(Clone)]
 pub struct ConsentStore {
     db: BlockDBHandle,
+    keyring: Option<std::sync::Arc<crate::gdpr::SubjectKeyring>>,
 }
 
 impl ConsentStore {
     pub fn new(db: BlockDBHandle) -> Self {
-        ConsentStore { db }
+        ConsentStore { db, keyring: None }
+    }
+
+    /// Consent store with crypto-shredding: event values are encrypted per subject and
+    /// `erase_subject` can permanently destroy a subject's data.
+    pub fn with_keyring(
+        db: BlockDBHandle,
+        keyring: std::sync::Arc<crate::gdpr::SubjectKeyring>,
+    ) -> Self {
+        ConsentStore { db, keyring: Some(keyring) }
+    }
+
+    /// Build the stored value for an event: plaintext JSON, or ciphertext when a
+    /// keyring is configured (encrypted under the subject's data key).
+    pub fn encode_value(&self, subject_id: &str, event: &ConsentEvent) -> Result<Vec<u8>, BlockDBError> {
+        let plain = serde_json::to_vec(event)
+            .map_err(|e| BlockDBError::InvalidData(format!("serialize consent event: {}", e)))?;
+        match &self.keyring {
+            Some(kr) => kr.encrypt(subject_id, &plain),
+            None => Ok(plain),
+        }
+    }
+
+    /// Decode a stored value back into an event. Returns `Ok(None)` when the subject's
+    /// key has been erased (the event is permanently unrecoverable).
+    fn decode_value(&self, subject_id: &str, value: &[u8]) -> Result<Option<ConsentEvent>, BlockDBError> {
+        let plain = match &self.keyring {
+            Some(kr) => match kr.decrypt(subject_id, value)? {
+                Some(p) => p,
+                None => return Ok(None), // erased
+            },
+            None => value.to_vec(),
+        };
+        let event = serde_json::from_slice(&plain)
+            .map_err(|e| BlockDBError::InvalidData(format!("corrupt consent event: {}", e)))?;
+        Ok(Some(event))
+    }
+
+    /// Crypto-shred a subject: destroy their data key so every encrypted consent event
+    /// for them becomes permanently unreadable. Returns whether a key was present.
+    /// Requires a keyring; on a plaintext store this is a no-op returning `false`.
+    pub fn erase_subject(&self, subject_id: &str) -> Result<bool, BlockDBError> {
+        match &self.keyring {
+            Some(kr) => kr.erase(subject_id),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether this store has crypto-shredding enabled.
+    pub fn erasure_enabled(&self) -> bool {
+        self.keyring.is_some()
     }
 
     /// Record a consent grant. Returns the stored event (including its proof hash).
@@ -254,8 +311,10 @@ impl ConsentStore {
         metadata: BTreeMap<String, String>,
         expires_at_ms: Option<u64>,
     ) -> Result<ConsentEvent, BlockDBError> {
-        let (key, value, event) =
+        let (key, _plain, event) =
             Self::prepare_event(subject_id, purpose, status, metadata, expires_at_ms)?;
+        // Encrypt the value per subject when crypto-shredding is enabled.
+        let value = self.encode_value(subject_id, &event)?;
         // Each event has a unique, time-ordered key, so the append-only store accepts it.
         self.db.put(key.as_bytes(), &value).await?;
         Ok(event)
@@ -269,8 +328,9 @@ impl ConsentStore {
         let entries = self.db.scan_prefix(prefix.as_bytes()).await?;
         let mut by_purpose: BTreeMap<String, Vec<ConsentEvent>> = BTreeMap::new();
         for (_key, value) in entries {
-            let event: ConsentEvent = serde_json::from_slice(&value)
-                .map_err(|e| BlockDBError::InvalidData(format!("corrupt consent event: {}", e)))?;
+            let Some(event) = self.decode_value(subject_id, &value)? else {
+                continue; // erased
+            };
             by_purpose.entry(event.purpose.clone()).or_default().push(event);
         }
         for events in by_purpose.values_mut() {
@@ -293,9 +353,10 @@ impl ConsentStore {
         let entries = self.db.scan_prefix(prefix.as_bytes()).await?;
         let mut events = Vec::with_capacity(entries.len());
         for (_key, value) in entries {
-            let event: ConsentEvent = serde_json::from_slice(&value)
-                .map_err(|e| BlockDBError::InvalidData(format!("corrupt consent event: {}", e)))?;
-            events.push(event);
+            // Skip events whose subject key has been erased (unrecoverable).
+            if let Some(event) = self.decode_value(subject_id, &value)? {
+                events.push(event);
+            }
         }
         // Keys embed a zero-padded timestamp, so scan order is already chronological;
         // sort defensively in case of equal timestamps.
@@ -341,8 +402,9 @@ impl ConsentStore {
         // Group latest event per purpose.
         let mut latest_by_purpose: BTreeMap<String, ConsentEvent> = BTreeMap::new();
         for (_key, value) in entries {
-            let event: ConsentEvent = serde_json::from_slice(&value)
-                .map_err(|e| BlockDBError::InvalidData(format!("corrupt consent event: {}", e)))?;
+            let Some(event) = self.decode_value(subject_id, &value)? else {
+                continue; // erased
+            };
             latest_by_purpose
                 .entry(event.purpose.clone())
                 .and_modify(|existing| {
@@ -490,6 +552,45 @@ mod tests {
         // Events are chronological.
         let email = &export.events_by_purpose["email"];
         assert!(email[0].timestamp_ms <= email[1].timestamp_ms);
+    }
+
+    #[tokio::test]
+    async fn crypto_shredding_erases_subject() {
+        use crate::gdpr::{MasterKey, SubjectKeyring};
+        let dir = TempDir::new().unwrap();
+        let config = BlockDBConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let db = BlockDBHandle::new(config).unwrap();
+        let keyring = std::sync::Arc::new(
+            SubjectKeyring::open(&dir.path().join("keys"), MasterKey::generate()).unwrap(),
+        );
+        let store = ConsentStore::with_keyring(db, keyring);
+        assert!(store.erasure_enabled());
+
+        let mut md = BTreeMap::new();
+        md.insert("email".to_string(), "frank@example.com".to_string());
+        store.grant("frank", "marketing", md).await.unwrap();
+
+        // Readable before erasure.
+        assert!(store.is_granted("frank", "marketing").await.unwrap());
+        let hist = store.history("frank", "marketing").await.unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!(hist[0].verify());
+
+        // Erase the subject: the key is destroyed.
+        assert!(store.erase_subject("frank").unwrap());
+
+        // All of the subject's data is now unrecoverable — reads return nothing.
+        assert!(store.history("frank", "marketing").await.unwrap().is_empty());
+        assert!(store.status("frank", "marketing").await.unwrap().is_none());
+        assert!(!store.is_granted("frank", "marketing").await.unwrap());
+        assert!(store.list_for_subject("frank").await.unwrap().is_empty());
+        assert!(store.export_subject("frank").await.unwrap().events_by_purpose.is_empty());
+
+        // Erasing again reports nothing to erase.
+        assert!(!store.erase_subject("frank").unwrap());
     }
 
     #[tokio::test]

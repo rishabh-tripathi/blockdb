@@ -6,6 +6,12 @@
 
 **BlockDB** is a high-performance, distributed, append-only database with blockchain verification, designed for enterprise applications requiring strong consistency, immutable audit trails, and ACID compliance.
 
+## 📚 Documentation
+
+- [Deployment](docs/DEPLOYMENT.md) · [Consistency model](docs/CONSISTENCY.md) · [Security](docs/SECURITY.md) · [GDPR / consent](docs/GDPR.md) · [Operations runbook](docs/OPERATIONS.md)
+- [**Production-readiness roadmap**](docs/ROADMAP.md) — an honest account of what is done and what remains before adoption as a system of record.
+- [Formal TLA+ safety spec](formal/) of the consensus core.
+
 ## 🚀 Quick Start
 
 ```bash

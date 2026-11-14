@@ -104,12 +104,17 @@ AppendEntry(s, t) ==
     /\ \E i \in 1..Len(log[s]) :
          /\ i <= Len(log[t]) + 1
          /\ i > commitIndex[t]
+         \* Log-consistency: the entry before i must match (vacuous at i=1). The
+         \* `i > 1` guard is FALSE at i=1 so the /\ short-circuits before indexing
+         \* log[t][i-1] (which would be log[t][0], out of domain).
          /\ \/ i = 1
-            \/ /\ i - 1 <= Len(log[t])
+            \/ /\ i > 1
                /\ log[t][i-1].term = log[s][i-1].term
-         \* Only act when this actually changes t's log (append or fix conflict).
+         \* Only act when this changes t's log (new entry, or fix a conflict). The
+         \* `i <= Len(log[t])` guard protects the log[t][i] access.
          /\ \/ i > Len(log[t])
-            \/ log[t][i] /= log[s][i]
+            \/ /\ i <= Len(log[t])
+               /\ log[t][i] /= log[s][i]
          /\ log' = [log EXCEPT ![t] = Append(SubSeq(log[t], 1, i-1), log[s][i])]
     /\ currentTerm' = [currentTerm EXCEPT ![t] = currentTerm[s]]
     /\ state'       = [state EXCEPT ![t] = Follower]
@@ -192,7 +197,7 @@ LeaderCompleteness ==
 StateMachineSafety ==
     \A s, t \in Server :
         \A i \in 1..(IF commitIndex[s] < commitIndex[t] THEN commitIndex[s] ELSE commitIndex[t]) :
-            log[s][i] = log[t][i]
+            (i <= Len(log[s]) /\ i <= Len(log[t])) => log[s][i] = log[t][i]
 
 Invariants ==
     /\ TypeOK

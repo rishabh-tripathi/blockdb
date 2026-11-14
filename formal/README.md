@@ -6,10 +6,16 @@ four safety invariants that underpin linearizability:
 
 - **ElectionSafety** — at most one leader per term.
 - **LogMatching** — logs that agree at an index agree on all earlier entries.
-- **LeaderCompleteness** / **StateMachineSafety** — no two servers ever hold
-  different committed entries at the same index.
+- **LeaderCompleteness** — a committed entry is present, unchanged, in the log of
+  every leader whose term is at least the entry's commit term (tracked via a
+  `committed` history variable).
+- **StateMachineSafety** — no two servers hold different committed entries at the
+  same index.
+- **CommitIndexBounded** — commitIndex never exceeds the log length.
 
-It models the *protocol design*, not the Rust code line-by-line. It abstracts
+The model includes conflicting-entry **truncation** (Raft §5.3): a follower
+replaces a conflicting suffix, never overwriting its own committed prefix. It
+models the *protocol design*, not the Rust code line-by-line, and abstracts
 timers, message loss/reordering, and concrete state-machine values.
 
 ## Checking it

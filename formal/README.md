@@ -25,11 +25,18 @@ java -cp tla2tools.jar tlc2.TLC -config MC_Raft.cfg Raft.tla
 2 values, terms and log length bounded at 3). Increase the bounds for more
 coverage at the cost of state-space size.
 
-## Status — important
+## CI
 
-This spec was authored alongside the implementation but **has not yet been
-machine-checked with TLC in this environment** (the TLC download was blocked by
-the sandbox). Treat it as a reviewed specification, not a completed proof, until
-it is run under TLC in CI. Wiring `tlc2.TLC` into CI against this config — and an
-independent Jepsen run against a live cluster — are the top items in
-`../docs/ROADMAP.md` before BlockDB is adopted as a system of record.
+`.github/workflows/formal.yml` runs exactly this check on every push that touches
+`formal/` (TLC is downloaded there — it could not be fetched in the authoring
+sandbox, but runs in CI). So the safety invariants are verified continuously on
+the finite instance in `MC_Raft.cfg`, not merely asserted.
+
+## Scope and honesty
+
+This is an abstract model of the *protocol*, model-checked on a small finite
+instance. It is strong evidence for the design's safety but is **not** equivalent
+to verifying the Rust implementation, nor to an adversarial **Jepsen** run
+against a live cluster. Both the broader TLC instance and a Jepsen run (see
+`../jepsen/`) remain recommended before BlockDB is adopted as a system of record;
+see `../docs/ROADMAP.md`.

@@ -24,14 +24,18 @@ candid so adopters can make an informed decision.
 ## Remaining before "sell it as the system of record"
 
 ### 1. Independent consensus verification — **highest priority**
-The Raft implementation is hand-rolled. It passes in-repo fault and partition
-tests and ships with a TLA+ safety spec, but it has **not** been run under an
-external **Jepsen** suite, nor has the TLA+ spec been machine-checked with TLC in
-CI. Before betting compliance data on it:
-- Run Jepsen with nemeses (partitions, clock skew, pauses) asserting
-  linearizability over the KV register.
-- Model-check `formal/Raft.tla` with TLC in CI.
-- Alternatively, adopt a proven Raft library (e.g. `openraft`, `tikv/raft-rs`).
+The Raft implementation is hand-rolled. Now in place:
+- **TLC in CI** — `.github/workflows/formal.yml` model-checks `formal/Raft.tla`
+  (ElectionSafety, LogMatching, StateMachineSafety) on every change to `formal/`.
+- **Jepsen scaffold** — `jepsen/` holds a partition-nemesis set/durability test.
+
+Still required before betting compliance data on it:
+- **Run** the Jepsen test against a real multi-node cluster (it needs an SSH
+  cluster, not available in CI) and add clock-skew/pause nemeses and a
+  linearizable-register variant.
+- Broaden the TLC instance (more servers/terms) and keep it green.
+- Consider adopting a proven Raft library (e.g. `openraft`, `tikv/raft-rs`) as a
+  lower-risk alternative to maintaining a hand-rolled implementation.
 
 ### 2. Cluster-wide crypto-shredding automation
 Single-node crypto-shredding is complete. Cluster-wide erasure needs automatic

@@ -72,14 +72,9 @@ impl AuthManager {
             persist_path: None,
         };
 
-        // Initialize default admin user if configured
-        if !auth_manager.config.admin_users.is_empty() {
-            for admin_user in &auth_manager.config.admin_users.clone() {
-                if let Err(e) = auth_manager.create_admin_user(admin_user.clone(), "admin123") {
-                    eprintln!("Failed to create admin user {}: {}", admin_user, e);
-                }
-            }
-        }
+        // Seed any configured admin users with a generated strong password (logged
+        // once) instead of a hardcoded default.
+        auth_manager.seed_configured_admins();
 
         auth_manager
     }
@@ -124,15 +119,47 @@ impl AuthManager {
             nonce_tracker: Arc::new(RwLock::new(HashMap::new())),
             persist_path: Some(path),
         };
-        if !auth_manager.config.admin_users.is_empty() {
-            for admin_user in &auth_manager.config.admin_users.clone() {
-                if let Err(e) = auth_manager.create_admin_user(admin_user.clone(), "admin123") {
-                    eprintln!("Failed to create admin user {}: {}", admin_user, e);
-                }
-            }
-        }
+        auth_manager.seed_configured_admins();
         auth_manager.persist();
         auth_manager
+    }
+
+    /// Seed any configured admin users that don't already exist, each with a freshly
+    /// generated strong password surfaced once in the logs. This replaces the former
+    /// hardcoded `admin123`, which was a critical default-credential vulnerability.
+    /// Operators should bootstrap admins explicitly (see `ensure_admin`) and rotate
+    /// this generated password immediately.
+    fn seed_configured_admins(&self) {
+        for admin_user in &self.config.admin_users.clone() {
+            // Skip if the admin already exists (e.g. reloaded from a snapshot).
+            if self.identity_chain.read().unwrap().find_identity(admin_user).is_some() {
+                continue;
+            }
+            let password = generate_secure_password();
+            match self.create_admin_user(admin_user.clone(), &password) {
+                Ok(_) => {
+                    tracing::warn!(
+                        user = %admin_user,
+                        "no admin bootstrap configured; generated a random admin password \
+                         (shown once): {} — change it immediately",
+                        password
+                    );
+                }
+                Err(e) => tracing::error!(user = %admin_user, error = %e, "failed to seed admin"),
+            }
+        }
+    }
+
+    /// Create an admin user if it does not already exist. Returns Ok(true) if created,
+    /// Ok(false) if it already existed. Used by operators to bootstrap a known admin
+    /// credential (e.g. from a secrets manager) rather than relying on the generated
+    /// one. The password must satisfy the configured strength policy.
+    pub fn ensure_admin(&self, user: UserId, password: &str) -> Result<bool, AuthError> {
+        if self.identity_chain.read().unwrap().find_identity(&user).is_some() {
+            return Ok(false);
+        }
+        self.create_admin_user(user, password)?;
+        Ok(true)
     }
 
     fn load_snapshot(path: &std::path::Path) -> Result<AuthSnapshot, Box<dyn std::error::Error>> {
@@ -510,6 +537,35 @@ impl AuthManager {
         Ok(())
     }
 }
+
+/// Generate a strong random password that satisfies the default strength policy
+/// (upper, lower, digit, special), 24 characters of CSPRNG output.
+pub fn generate_secure_password() -> String {
+    use rand::Rng;
+    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const LOWER: &[u8] = b"abcdefghijkmnpqrstuvwxyz";
+    const DIGIT: &[u8] = b"23456789";
+    const SPECIAL: &[u8] = b"!@#$%^&*()-_=+";
+    const ALL: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*()-_=+";
+
+    let mut rng = rand::thread_rng();
+    let mut pw: Vec<u8> = Vec::with_capacity(24);
+    // Guarantee at least one of each required class.
+    pw.push(UPPER[rng.gen_range(0..UPPER.len())]);
+    pw.push(LOWER[rng.gen_range(0..LOWER.len())]);
+    pw.push(DIGIT[rng.gen_range(0..DIGIT.len())]);
+    pw.push(SPECIAL[rng.gen_range(0..SPECIAL.len())]);
+    for _ in 0..20 {
+        pw.push(ALL[rng.gen_range(0..ALL.len())]);
+    }
+    // Shuffle so the guaranteed characters aren't always in fixed positions.
+    for i in (1..pw.len()).rev() {
+        let j = rng.gen_range(0..=i);
+        pw.swap(i, j);
+    }
+    String::from_utf8(pw).unwrap_or_else(|_| "ChangeMe!23456789".to_string())
+}
+
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
@@ -564,6 +620,23 @@ mod persistence_tests {
             admin_pubkey, admin_pubkey2,
             "admin identity was regenerated instead of reloaded"
         );
+    }
+
+    #[test]
+    fn generated_password_is_strong_and_accepted() {
+        for _ in 0..50 {
+            let pw = generate_secure_password();
+            assert!(pw.len() >= 20);
+            assert!(pw.chars().any(|c| c.is_ascii_uppercase()));
+            assert!(pw.chars().any(|c| c.is_ascii_lowercase()));
+            assert!(pw.chars().any(|c| c.is_ascii_digit()));
+            assert!(pw.chars().any(|c| !c.is_alphanumeric()));
+        }
+        // A manager with the default (strong) policy accepts the generated password.
+        let mgr = AuthManager::new(AuthConfig { admin_users: vec![], ..Default::default() });
+        let pw = generate_secure_password();
+        mgr.create_user("u".into(), &pw, PermissionSet::read_only(), None, 0).unwrap();
+        assert!(mgr.authenticate("u", &pw).is_ok());
     }
 
     #[test]

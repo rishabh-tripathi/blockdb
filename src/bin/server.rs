@@ -110,20 +110,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_handle = BlockDBHandle::new(db_config)?;
 
     let server = if api_config.auth_enabled {
-        let auth_config = AuthConfig::default();
+        // Disable the library's auto-seeded admin; the server bootstraps admin
+        // explicitly so an operator-provided credential is always honoured.
+        let auth_config = AuthConfig {
+            admin_users: vec![],
+            ..AuthConfig::default()
+        };
         let am = AuthManager::new_persistent(auth_config, &auth_dir);
-        if let (Ok(user), Ok(pass)) = (
+        match (
             std::env::var("BLOCKDB_ADMIN_USER"),
             std::env::var("BLOCKDB_ADMIN_PASSWORD"),
         ) {
-            // Bootstrap an admin from the environment (ignored if it already exists
-            // from a previous run).
-            let _ = am.create_admin_user(user, &pass);
-        } else {
-            tracing::warn!(
-                "auth enabled but BLOCKDB_ADMIN_USER/BLOCKDB_ADMIN_PASSWORD not set; \
-                 using the built-in default admin — change the password immediately"
-            );
+            (Ok(user), Ok(pass)) => {
+                // Bootstrap an admin from the environment (no-op if it already exists).
+                match am.ensure_admin(user.clone(), &pass) {
+                    Ok(true) => tracing::info!(%user, "bootstrapped admin from environment"),
+                    Ok(false) => tracing::info!(%user, "admin already exists; env credential not reapplied"),
+                    Err(e) => {
+                        return Err(format!(
+                            "BLOCKDB_ADMIN_PASSWORD rejected ({}). Choose a stronger password.",
+                            e
+                        )
+                        .into());
+                    }
+                }
+            }
+            _ => {
+                // No operator credential supplied: create a default admin with a
+                // generated strong password, surfaced once, instead of a known default.
+                let generated = blockdb::auth::generate_secure_password();
+                match am.ensure_admin("admin".to_string(), &generated) {
+                    Ok(true) => tracing::warn!(
+                        "BLOCKDB_ADMIN_USER/PASSWORD not set; created admin 'admin' with a \
+                         generated password (shown once): {} — set the env vars and rotate it",
+                        generated
+                    ),
+                    Ok(false) => tracing::info!("admin already exists from a previous run"),
+                    Err(e) => return Err(format!("failed to bootstrap admin: {}", e).into()),
+                }
+            }
         }
         BlockDBServer::with_auth(db_handle, api_config, am)
     } else {

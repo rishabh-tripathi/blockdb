@@ -160,6 +160,8 @@ pub struct ClusterNode {
     security: ClusterSecurity,
     metrics: Arc<ClusterMetrics>,
     start_time: Instant,
+    /// Pooled HTTP client reused for leader-forwarding (reads and writes).
+    http: Client<hyper::client::HttpConnector>,
 }
 
 impl ClusterNode {
@@ -213,6 +215,10 @@ impl ClusterNode {
             security,
             metrics: Arc::new(ClusterMetrics::default()),
             start_time: Instant::now(),
+            http: Client::builder()
+                .pool_idle_timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(8)
+                .build_http(),
         }))
     }
 
@@ -427,8 +433,7 @@ impl ClusterNode {
             .body(Body::from(body))
             .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
 
-        let client = Client::new();
-        let resp = tokio::time::timeout(self.forward_timeout, client.request(req))
+        let resp = tokio::time::timeout(self.forward_timeout, self.http.request(req))
             .await
             .map_err(|_| BlockDBError::ConsensusError("forward to leader timed out".to_string()))?
             .map_err(|e| BlockDBError::ConsensusError(format!("forward to leader failed: {}", e)))?;
@@ -467,8 +472,7 @@ impl ClusterNode {
             .body(Body::empty())
             .map_err(|e| BlockDBError::ApiError(e.to_string()))?;
 
-        let client = Client::new();
-        let resp = tokio::time::timeout(self.forward_timeout, client.request(req))
+        let resp = tokio::time::timeout(self.forward_timeout, self.http.request(req))
             .await
             .map_err(|_| BlockDBError::ConsensusError("read forward to leader timed out".to_string()))?
             .map_err(|e| {

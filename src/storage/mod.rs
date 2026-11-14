@@ -13,6 +13,7 @@ pub mod sstable;
 pub mod blockchain;
 pub mod compaction;
 pub mod collection;
+pub mod format;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -75,6 +76,10 @@ impl std::fmt::Debug for BlockDB {
 impl BlockDB {
     pub fn new(config: BlockDBConfig) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&config.data_dir)?;
+
+        // Verify (and stamp) the on-disk format version before touching any data
+        // files, so a directory written by a newer build is rejected up front.
+        format::open_or_init(&config.data_dir)?;
 
         // Durability model driven by wal_sync_interval_ms:
         //   0  -> fsync on every append (strongest; acknowledged writes survive power loss)

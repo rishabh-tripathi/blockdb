@@ -119,7 +119,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                         }
                         
                         // Mixed operations
-                        for i in 0..1000 {
+                        for _i in 0..1000 {
                             if fastrand::usize(0..100) < read_pct {
                                 // Read operation
                                 let key_id = fastrand::usize(0..1000);
@@ -230,13 +230,13 @@ fn bench_authentication_operations(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
-                let config = BlockDBConfig {
+                let _config = BlockDBConfig {
                     data_dir: temp_dir.path().to_string_lossy().to_string(),
                     auth_enabled: true,
                     ..Default::default()
                 };
                 
-                let mut auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+                let auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
                 
                 for i in 0..100 {
                     let username = format!("bench_user_{}", i);
@@ -255,13 +255,13 @@ fn bench_authentication_operations(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
-                let config = BlockDBConfig {
+                let _config = BlockDBConfig {
                     data_dir: temp_dir.path().to_string_lossy().to_string(),
                     auth_enabled: true,
                     ..Default::default()
                 };
                 
-                let mut auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+                let auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
                 
                 // Pre-create users
                 for i in 0..100 {
@@ -285,13 +285,13 @@ fn bench_authentication_operations(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
-                let config = BlockDBConfig {
+                let _config = BlockDBConfig {
                     data_dir: temp_dir.path().to_string_lossy().to_string(),
                     auth_enabled: true,
                     ..Default::default()
                 };
                 
-                let mut auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+                let auth_manager = AuthManager::new(AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
                 
                 // Create user and get session
                 auth_manager.create_user("session_user".to_string(), "session_pass", PermissionSet::from_permissions(vec![Permission::Read]), None, 0).unwrap();

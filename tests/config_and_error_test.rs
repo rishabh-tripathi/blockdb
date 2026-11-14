@@ -1,7 +1,6 @@
 use blockdb::{BlockDBConfig, BlockDBHandle, AuthManager, BlockDBError};
 use tempfile::TempDir;
 use std::fs;
-use rand::Rng;
 
 /// Configuration and error handling tests
 /// Tests config loading, validation, and comprehensive error scenarios
@@ -97,7 +96,7 @@ async fn test_invalid_data_directory() {
         ..Default::default()
     };
     
-    let db = BlockDBHandle::new(readonly_config);
+    let _db = BlockDBHandle::new(readonly_config);
     // Should work unless the directory is truly read-only
     // In practice, this test depends on system permissions
 }
@@ -357,7 +356,7 @@ async fn test_error_propagation() {
     assert!(!debug_string.is_empty());
     
     // Test error source chain (if implemented)
-    let source = std::error::Error::source(&error);
+    let _source = std::error::Error::source(&error);
     // May or may not have a source depending on implementation
 }
 

@@ -329,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_collection_action(action: CollectionAction, collection_manager: &CollectionManager) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        CollectionAction::Create { name, description } => {
+        CollectionAction::Create { name, description: _ } => {
             let collection_id = collection_manager.create_collection(
                 name.clone(),
                 None, // No schema for now

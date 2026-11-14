@@ -170,7 +170,7 @@ impl LockManager {
         match wait_result {
             Ok(_) => {
                 // Check if we got the lock
-                let mut locks = resource_locks.lock();
+                let locks = resource_locks.lock();
                 if locks.has_lock(transaction_id) {
                     // Track this lock for the transaction
                     self.transaction_locks

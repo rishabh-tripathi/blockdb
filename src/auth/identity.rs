@@ -1,6 +1,6 @@
 use crate::auth::{
     crypto::{CryptoUtils, KeyPair},
-    permissions::{Permission, PermissionSet},
+    permissions::PermissionSet,
     AuthError, PrivateKey, PublicKey, Signature, UserId,
 };
 use serde::{Deserialize, Serialize};

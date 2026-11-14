@@ -54,7 +54,7 @@ pub fn open_or_init(data_dir: &str) -> Result<u32, BlockDBError> {
 /// changes register their migration step here. (v1 is the first versioned format, so
 /// there are no steps yet — the framework is in place for the first breaking change.)
 fn migrate(data_dir: &str, from: u32, to: u32) -> Result<(), BlockDBError> {
-    let mut v = from;
+    let v = from;
     while v < to {
         match v {
             // Example for the future:

@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Read, Write, Seek, SeekFrom};
 use serde::{Serialize, Deserialize};
 use crate::storage::{Record, memtable::MemTable};
 

@@ -1,5 +1,5 @@
 use crate::auth::{
-    crypto::{CryptoUtils, KeyPair},
+    crypto::KeyPair,
     identity::{CryptoIdentity, IdentityChain},
     permissions::{Permission, PermissionOperation, PermissionSet},
     AuthContext, AuthError, SessionId, UserId,
@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {

@@ -3,8 +3,8 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 use std::collections::HashMap;
 
-/// Property-based tests using proptest
-/// Tests database properties that should hold for any valid input
+// Property-based tests using proptest.
+// Tests database properties that should hold for any valid input.
 
 proptest! {
     #[test]
@@ -164,13 +164,13 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let config = BlockDBConfig {
+            let _config = BlockDBConfig {
                 data_dir: temp_dir.path().to_string_lossy().to_string(),
                 auth_enabled: true,
                 ..Default::default()
             };
 
-            let mut auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+            let auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
             let all_permissions = vec![
                 Permission::Read,
                 Permission::Write,
@@ -229,14 +229,14 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let config = BlockDBConfig {
+            let _config = BlockDBConfig {
                 data_dir: temp_dir.path().to_string_lossy().to_string(),
                 auth_enabled: true,
                 session_duration_hours: 1,
                 ..Default::default()
             };
 
-            let mut auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+            let auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
             let mut valid_sessions = Vec::new();
 
             // Create users and sessions
@@ -494,13 +494,13 @@ mod deterministic_property_tests {
     #[tokio::test]
     async fn test_auth_admin_permission_property() {
         let temp_dir = TempDir::new().unwrap();
-        let config = BlockDBConfig {
+        let _config = BlockDBConfig {
             data_dir: temp_dir.path().to_string_lossy().to_string(),
             auth_enabled: true,
             ..Default::default()
         };
 
-        let mut auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
+        let auth_manager = AuthManager::new(blockdb::auth::AuthConfig { require_strong_passwords: false, admin_users: vec![], ..Default::default() });
 
         // Property: Admin permission should imply all other permissions
         auth_manager

@@ -1,6 +1,5 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write, Seek, SeekFrom};
-use std::path::Path;
 use crate::storage::Record;
 
 /// Per-record framing: [payload_len: u32 BE][crc32: u32 BE][payload: bincode(Record)].

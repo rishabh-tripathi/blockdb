@@ -5,7 +5,6 @@ use crate::error::BlockDBError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 
 // Extended configuration that includes authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +291,7 @@ impl AuthenticatedDistributedBlockDB {
 
     pub async fn authenticated_delete(
         &self,
-        key: &[u8],
+        _key: &[u8],
         auth_context: &AuthContext,
     ) -> Result<(), BlockDBError> {
         if let Some(auth_manager) = &self.auth_manager {

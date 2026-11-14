@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::error::BlockDBError;
-use super::{BlockDB, BlockDBConfig, Record};
+use super::{BlockDB, BlockDBConfig};
 
 pub type CollectionId = String;
 
@@ -194,7 +194,7 @@ impl Collection {
         self.validate_document(value)?;
 
         // Store in underlying BlockDB
-        let mut storage = self.storage.write().unwrap();
+        let storage = self.storage.write().unwrap();
         storage.put(key, value)?;
 
         // Update statistics
@@ -211,7 +211,7 @@ impl Collection {
         storage.get(key).map_err(BlockDBError::from)
     }
 
-    pub fn delete(&self, key: &[u8]) -> Result<(), BlockDBError> {
+    pub fn delete(&self, _key: &[u8]) -> Result<(), BlockDBError> {
         // Note: In append-only architecture, this marks as deleted
         // For now, return error as delete is not supported in append-only
         Err(BlockDBError::ApiError(
@@ -219,9 +219,9 @@ impl Collection {
         ))
     }
 
-    pub fn list_keys(&self, prefix: Option<&[u8]>, limit: Option<usize>) -> Result<Vec<Vec<u8>>, BlockDBError> {
+    pub fn list_keys(&self, _prefix: Option<&[u8]>, _limit: Option<usize>) -> Result<Vec<Vec<u8>>, BlockDBError> {
         // Implementation would scan through keys with optional prefix filter
-        let storage = self.storage.read().unwrap();
+        let _storage = self.storage.read().unwrap();
         
         // For now, return empty list as this requires memtable/sstable scanning
         // In full implementation, this would scan through all keys
@@ -251,7 +251,7 @@ impl Collection {
                 schema.indexes.push(index_def.clone());
             } else {
                 // Create schema if it doesn't exist
-                let mut schema = CollectionSchema {
+                let schema = CollectionSchema {
                     version: 1,
                     fields: HashMap::new(),
                     required_fields: Vec::new(),
@@ -320,7 +320,7 @@ impl Collection {
         let mut indexes = self.indexes.write().unwrap();
         
         // For each index, add the key to the index
-        for (index_name, index_keys) in indexes.iter_mut() {
+        for (_index_name, index_keys) in indexes.iter_mut() {
             index_keys.push(key.to_vec());
         }
 
@@ -334,7 +334,7 @@ impl Collection {
 
     /// Flush all data in this collection
     pub fn flush(&self) -> Result<(), BlockDBError> {
-        let mut storage = self.storage.write().unwrap();
+        let storage = self.storage.write().unwrap();
         storage.flush_all().map_err(BlockDBError::from)?;
         
         // Reset collection statistics
@@ -359,6 +359,8 @@ pub struct CollectionManager {
     collections: Arc<RwLock<HashMap<CollectionId, Collection>>>,
     metadata_store: Arc<RwLock<HashMap<CollectionId, CollectionMetadata>>>,
     config: BlockDBConfig,
+    /// Reserved for the in-progress multi-collection feature.
+    #[allow(dead_code)]
     default_collection: Option<CollectionId>,
 }
 
@@ -606,7 +608,7 @@ impl CollectionManager {
 
     pub fn get_total_stats(&self) -> Result<(usize, u64, u64), BlockDBError> {
         let collections = self.collections.read().unwrap();
-        let mut total_collections = collections.len();
+        let total_collections = collections.len();
         let mut total_documents = 0u64;
         let mut total_size_bytes = 0u64;
 
@@ -1009,7 +1011,7 @@ mod tests {
         let manager = CollectionManager::new(config).unwrap();
         
         // Create first collection
-        let collection1_id = manager.create_collection(
+        let _collection1_id = manager.create_collection(
             "users".to_string(), 
             None, 
             None, 

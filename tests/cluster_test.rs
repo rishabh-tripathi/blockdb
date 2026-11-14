@@ -352,3 +352,87 @@ async fn test_linearizable_read_from_follower() {
         .unwrap();
     assert_eq!(got, Some(b"committed".to_vec()));
 }
+
+#[tokio::test]
+async fn test_consent_replicates_across_cluster() {
+    use std::collections::BTreeMap;
+
+    let cluster = spawn_cluster(3).await;
+    let leader = wait_for_leader(&cluster).await;
+    let follower = (leader + 1) % 3;
+
+    // Grant consent via a FOLLOWER — it must forward through Raft and replicate.
+    let mut meta = BTreeMap::new();
+    meta.insert("policy_version".to_string(), "v1.2".to_string());
+    cluster.nodes[follower]
+        .consent_grant("alice", "marketing", meta)
+        .await
+        .unwrap();
+
+    // Every node converges on Granted.
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        let mut granted = false;
+        for _ in 0..100 {
+            if node.consent_status("alice", "marketing").await.unwrap()
+                .map(|s| s.status == blockdb::consent::ConsentStatus::Granted)
+                .unwrap_or(false)
+            {
+                granted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(granted, "node {} never saw the granted consent", i);
+    }
+
+    // Withdraw on the leader; history retains both events (append-only audit trail).
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    cluster.nodes[leader]
+        .consent_withdraw("alice", "marketing", BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut withdrawn = false;
+    for _ in 0..100 {
+        let st = cluster.nodes[leader].consent_status("alice", "marketing").await.unwrap();
+        if st.map(|s| s.status == blockdb::consent::ConsentStatus::Withdrawn).unwrap_or(false) {
+            withdrawn = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(withdrawn, "withdrawal did not take effect");
+
+    let history = cluster.nodes[leader].consent_history("alice", "marketing").await.unwrap();
+    assert_eq!(history.len(), 2, "both consent events retained for audit");
+    assert!(history.iter().all(|e| e.verify()), "event proof hashes must verify");
+
+    // Scan over the consent prefix returns the subject's events.
+    let scanned = cluster.nodes[leader].scan_prefix(b"consent/alice").await.unwrap();
+    assert!(scanned.len() >= 2);
+}
+
+#[tokio::test]
+async fn test_consent_endpoints_over_http() {
+    let cluster = spawn_cluster(1).await;
+    let _ = wait_for_leader(&cluster).await;
+    let port = cluster.ports[0];
+
+    // POST /consent/grant
+    let uri = format!("http://127.0.0.1:{}/consent/grant", port);
+    let body = r#"{"subject_id":"bob","purpose":"analytics"}"#;
+    let req = Request::post(&uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = Client::new().request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GET /consent/status reflects the grant.
+    let uri = format!("http://127.0.0.1:{}/consent/status?subject=bob&purpose=analytics", port);
+    let resp = Client::new().get(uri.parse().unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["state"]["status"], "Granted");
+}

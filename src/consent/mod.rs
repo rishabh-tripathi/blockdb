@@ -53,7 +53,7 @@ pub struct ConsentEvent {
 }
 
 impl ConsentEvent {
-    fn new(
+    pub fn new(
         subject_id: String,
         purpose: String,
         status: ConsentStatus,
@@ -145,13 +145,17 @@ impl ConsentStore {
             .await
     }
 
-    async fn append_event(
-        &self,
+    /// Validate inputs and build the immutable `(key, value, event)` for a consent
+    /// event WITHOUT writing it. The append-only key is unique and time-ordered. This
+    /// is the shared core used both by the local writer and by the cluster, which must
+    /// construct the event once and then replicate the resulting key/value through Raft
+    /// (so every node applies identical bytes).
+    pub fn prepare_event(
         subject_id: &str,
         purpose: &str,
         status: ConsentStatus,
         metadata: BTreeMap<String, String>,
-    ) -> Result<ConsentEvent, BlockDBError> {
+    ) -> Result<(String, Vec<u8>, ConsentEvent), BlockDBError> {
         if subject_id.is_empty() || purpose.is_empty() {
             return Err(BlockDBError::InvalidData(
                 "subject_id and purpose must not be empty".to_string(),
@@ -163,16 +167,22 @@ impl ConsentStore {
             ));
         }
 
-        let event = ConsentEvent::new(
-            subject_id.to_string(),
-            purpose.to_string(),
-            status,
-            metadata,
-        );
+        let event = ConsentEvent::new(subject_id.to_string(), purpose.to_string(), status, metadata);
         let key = event_key(subject_id, purpose, event.timestamp_ms, &event.event_id);
-        let value = serde_json::to_vec(&event)
-            .map_err(|e| BlockDBError::InvalidData(format!("failed to serialize consent event: {}", e)))?;
+        let value = serde_json::to_vec(&event).map_err(|e| {
+            BlockDBError::InvalidData(format!("failed to serialize consent event: {}", e))
+        })?;
+        Ok((key, value, event))
+    }
 
+    async fn append_event(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        status: ConsentStatus,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        let (key, value, event) = Self::prepare_event(subject_id, purpose, status, metadata)?;
         // Each event has a unique, time-ordered key, so the append-only store accepts it.
         self.db.put(key.as_bytes(), &value).await?;
         Ok(event)

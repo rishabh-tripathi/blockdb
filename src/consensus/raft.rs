@@ -126,14 +126,15 @@ impl RaftNode {
         };
         let active_peers = Self::fold_membership(base_membership, &entries);
 
+        let mut log = ReplicatedLog::with_store(log_store, entries, base_index, base_term);
+        log.set_compaction_retention(config.compaction_retention);
+
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
         Ok(RaftNode {
             config,
             active_peers: Arc::new(RwLock::new(active_peers)),
             state: Arc::new(RwLock::new(consensus_state)),
-            log: Arc::new(RwLock::new(ReplicatedLog::with_store(
-                log_store, entries, base_index, base_term,
-            ))),
+            log: Arc::new(RwLock::new(log)),
             next_index: Arc::new(RwLock::new(HashMap::new())),
             match_index: Arc::new(RwLock::new(HashMap::new())),
             message_sender,
@@ -402,6 +403,28 @@ impl RaftNode {
             ConsensusMessage::AppendEntriesResponse { term, success, match_index } => {
                 self.handle_append_entries_response(sender, term, success, match_index).await;
             }
+            ConsensusMessage::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                membership,
+                data,
+            } => {
+                self.handle_install_snapshot(
+                    sender,
+                    term,
+                    leader_id,
+                    last_included_index,
+                    last_included_term,
+                    membership,
+                    data,
+                )
+                .await;
+            }
+            ConsensusMessage::InstallSnapshotResponse { term, last_index } => {
+                self.handle_install_snapshot_response(sender, term, last_index).await;
+            }
             ConsensusMessage::ClientRequest { operation, request_id } => {
                 let _ = self.handle_client_request(operation, request_id).await;
             }
@@ -627,7 +650,141 @@ impl RaftNode {
             }
         }
     }
-    
+
+    /// Follower side of InstallSnapshot: a leader is catching us up with a state-machine
+    /// snapshot because we fell below its compacted log.
+    async fn handle_install_snapshot(
+        &self,
+        sender: NodeId,
+        term: Term,
+        leader_id: NodeId,
+        last_included_index: u64,
+        last_included_term: Term,
+        membership: Vec<(String, String, u16)>,
+        data: Vec<u8>,
+    ) {
+        let mut dirty = false;
+        {
+            let mut state = self.state.write().await;
+            if term.0 < state.current_term.0 {
+                // Stale leader: reject with our current term.
+                let response = ConsensusMessage::InstallSnapshotResponse {
+                    term: state.current_term.clone(),
+                    last_index: self.log.read().await.last_log_index(),
+                };
+                drop(state);
+                self.send_message(sender, response).await;
+                return;
+            }
+            if term.0 > state.current_term.0 {
+                state.current_term = term.clone();
+                state.voted_for = None;
+                dirty = true;
+            }
+            state.state = RaftState::Follower;
+            state.leader_id = Some(leader_id);
+            state.last_heartbeat = SystemTime::now();
+        }
+
+        // If we are already at or beyond the snapshot point, ignore the data but ack.
+        let our_last = self.log.read().await.last_log_index();
+        let our_base = self.log.read().await.base_index();
+        if last_included_index <= our_base {
+            let (persist_term, persist_vote) = self.term_and_vote().await;
+            if dirty {
+                self.persist_hard_state(persist_term, persist_vote).await;
+            }
+            let response = ConsensusMessage::InstallSnapshotResponse {
+                term: Term(persist_term),
+                last_index: our_last,
+            };
+            self.send_message(sender, response).await;
+            return;
+        }
+
+        // Restore the state machine FIRST (so a crash before advancing the log never
+        // claims state we don't have), then install the snapshot baseline in the log.
+        if let Err(e) = self.state_machine.restore(&data).await {
+            tracing::error!(error = %e, "failed to restore snapshot; aborting install");
+            return;
+        }
+
+        {
+            let mut log = self.log.write().await;
+            if let Err(e) = log.install_snapshot(last_included_index, last_included_term.clone()) {
+                tracing::error!(error = %e, "failed to install snapshot into log");
+                return;
+            }
+        }
+
+        // Adopt the snapshot's membership.
+        {
+            let mut peers = self.active_peers.write().await;
+            peers.clear();
+            for (id, host, port) in &membership {
+                if *id != self.config.node_id.0 {
+                    peers.insert(NodeId::from_string(id.clone()), NodeAddress::new(host.clone(), *port));
+                }
+            }
+        }
+
+        // Persist the snapshot baseline + membership so a restart recovers it.
+        if let Some(store) = &self.snapshot_store {
+            let meta = SnapshotMeta {
+                base_index: last_included_index,
+                base_term: last_included_term.0,
+                membership,
+            };
+            let store = store.lock().await;
+            if let Err(e) = store.save(&meta) {
+                tracing::error!(error = %e, "failed to persist snapshot baseline");
+            }
+        }
+
+        let (persist_term, persist_vote) = self.term_and_vote().await;
+        if dirty {
+            self.persist_hard_state(persist_term, persist_vote).await;
+        }
+
+        tracing::info!(last_included_index, "installed snapshot from leader");
+        let response = ConsensusMessage::InstallSnapshotResponse {
+            term: Term(persist_term),
+            last_index: last_included_index,
+        };
+        self.send_message(sender, response).await;
+    }
+
+    /// Leader side of the InstallSnapshot ack: advance the follower's indices.
+    async fn handle_install_snapshot_response(&self, sender: NodeId, term: Term, last_index: u64) {
+        let mut state = self.state.write().await;
+        if term.0 > state.current_term.0 {
+            state.current_term = term;
+            state.state = RaftState::Follower;
+            state.voted_for = None;
+            let persist_term = state.current_term.0;
+            drop(state);
+            self.persist_hard_state(persist_term, None).await;
+            return;
+        }
+        if !matches!(state.state, RaftState::Leader) || term.0 != state.current_term.0 {
+            return;
+        }
+        drop(state);
+        {
+            let mut next_index = self.next_index.write().await;
+            let mut match_index = self.match_index.write().await;
+            match_index.insert(sender.clone(), last_index);
+            next_index.insert(sender, last_index + 1);
+        }
+        self.update_commit_index().await;
+    }
+
+    /// Current (term, voted_for) for persistence.
+    async fn term_and_vote(&self) -> (u64, Option<String>) {
+        let state = self.state.read().await;
+        (state.current_term.0, state.voted_for.as_ref().map(|n| n.0.clone()))
+    }
+
     async fn handle_client_request(&self, operation: Operation, request_id: Uuid) -> Result<(), BlockDBError> {
         {
             let state = self.state.read().await;
@@ -821,30 +978,70 @@ impl RaftNode {
         
         drop(state);
         
-        let log = self.log.read().await;
-        let next_index = self.next_index.read().await;
-        let leader_commit = log.get_commit_index();
-        
-        for (peer_id, &next_idx) in next_index.iter() {
-            let prev_log_index = next_idx.saturating_sub(1);
-            let prev_log_term = if prev_log_index == 0 {
-                Term::new()
-            } else {
-                log.get_term(prev_log_index).unwrap_or(Term::new())
-            };
-            
-            let entries = log.get_entries_from(next_idx);
-            
-            let message = ConsensusMessage::AppendEntries {
+        let (appends, snapshot_targets, base_index, base_term) = {
+            let log = self.log.read().await;
+            let next_index = self.next_index.read().await;
+            let leader_commit = log.get_commit_index();
+            let base_index = log.base_index();
+            let base_term = log.base_term();
+
+            let mut appends: Vec<(NodeId, ConsensusMessage)> = Vec::new();
+            let mut snapshot_targets: Vec<NodeId> = Vec::new();
+
+            for (peer_id, &next_idx) in next_index.iter() {
+                // If the follower needs entries at or below our compaction baseline, the
+                // log can no longer provide them: send a snapshot instead.
+                if next_idx <= base_index {
+                    snapshot_targets.push(peer_id.clone());
+                    continue;
+                }
+                let prev_log_index = next_idx.saturating_sub(1);
+                let prev_log_term = if prev_log_index == 0 {
+                    Term::new()
+                } else {
+                    log.get_term(prev_log_index).unwrap_or_else(Term::new)
+                };
+                let entries = log.get_entries_from(next_idx);
+                appends.push((
+                    peer_id.clone(),
+                    ConsensusMessage::AppendEntries {
+                        term: current_term.clone(),
+                        leader_id: leader_id.clone(),
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        leader_commit,
+                    },
+                ));
+            }
+            (appends, snapshot_targets, base_index, base_term)
+        };
+
+        for (peer_id, message) in appends {
+            self.send_message(peer_id, message).await;
+        }
+
+        if !snapshot_targets.is_empty() {
+            // Build the snapshot once for all lagging followers.
+            let data = self.state_machine.snapshot().await.unwrap_or_default();
+            let membership: Vec<(String, String, u16)> = self
+                .active_peers
+                .read()
+                .await
+                .iter()
+                .map(|(id, addr)| (id.0.clone(), addr.host.clone(), addr.port))
+                .collect();
+            let msg = ConsensusMessage::InstallSnapshot {
                 term: current_term.clone(),
                 leader_id: leader_id.clone(),
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
+                last_included_index: base_index,
+                last_included_term: base_term,
+                membership,
+                data,
             };
-            
-            self.send_message(peer_id.clone(), message).await;
+            for peer_id in snapshot_targets {
+                self.send_message(peer_id, msg.clone()).await;
+            }
         }
     }
     

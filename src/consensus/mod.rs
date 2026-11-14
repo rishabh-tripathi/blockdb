@@ -15,6 +15,19 @@ pub mod persistence;
 #[async_trait::async_trait]
 pub trait StateMachine: Send + Sync {
     async fn apply(&self, entry: &log_entry::LogEntry) -> Result<(), crate::error::BlockDBError>;
+
+    /// Serialize the full committed state, for transfer to a follower that has fallen
+    /// too far behind to catch up from the log (InstallSnapshot). Default: empty — a
+    /// state machine that opts out of snapshot transfer.
+    async fn snapshot(&self) -> Result<Vec<u8>, crate::error::BlockDBError> {
+        Ok(Vec::new())
+    }
+
+    /// Install a snapshot produced by `snapshot()` on this node, replacing/merging into
+    /// local state. Default: no-op.
+    async fn restore(&self, _data: &[u8]) -> Result<(), crate::error::BlockDBError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,6 +66,9 @@ pub struct ClusterConfig {
     pub peers: HashMap<NodeId, NodeAddress>,
     pub heartbeat_interval: Duration,
     pub election_timeout: Duration,
+    /// How many applied log entries to retain before compacting older ones. A follower
+    /// that falls further behind than this is caught up via InstallSnapshot.
+    pub compaction_retention: u64,
 }
 
 impl ClusterConfig {
@@ -63,6 +79,7 @@ impl ClusterConfig {
             peers: HashMap::new(),
             heartbeat_interval: Duration::from_millis(150),
             election_timeout: Duration::from_millis(300),
+            compaction_retention: 10_000,
         }
     }
     
@@ -132,6 +149,21 @@ pub enum ConsensusMessage {
         term: Term,
         success: bool,
         match_index: u64,
+    },
+    InstallSnapshot {
+        term: Term,
+        leader_id: NodeId,
+        last_included_index: u64,
+        last_included_term: Term,
+        /// Cluster membership as of the snapshot point.
+        membership: Vec<(String, String, u16)>,
+        /// Serialized state-machine snapshot.
+        data: Vec<u8>,
+    },
+    InstallSnapshotResponse {
+        term: Term,
+        /// The follower's last index after installing (so the leader can advance it).
+        last_index: u64,
     },
     ClientRequest {
         operation: crate::transaction::Operation,

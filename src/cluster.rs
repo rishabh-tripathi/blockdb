@@ -50,6 +50,33 @@ impl StateMachine for BlockDBStateMachine {
             _ => Ok(()),
         }
     }
+
+    /// Serialize the full committed key/value state for InstallSnapshot transfer.
+    async fn snapshot(&self) -> Result<Vec<u8>, BlockDBError> {
+        let all = self.db.scan_prefix(b"").await?;
+        bincode::serialize(&all)
+            .map_err(|e| BlockDBError::SerializationError(e))
+    }
+
+    /// Install a received snapshot by applying every key/value. The store is
+    /// append-only, so keys we already hold are rejected as duplicates and skipped —
+    /// the merge is idempotent and converges on the leader's state.
+    async fn restore(&self, data: &[u8]) -> Result<(), BlockDBError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = bincode::deserialize(data)
+            .map_err(|e| BlockDBError::SerializationError(e))?;
+        for (k, v) in pairs {
+            match self.db.put(&k, &v).await {
+                Ok(()) => {}
+                // A key we already have (same committed value) is fine.
+                Err(BlockDBError::DuplicateKey(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

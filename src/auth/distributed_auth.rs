@@ -103,6 +103,7 @@ impl AuthenticatedDistributedBlockDB {
                 peers,
                 heartbeat_interval: std::time::Duration::from_millis(config.cluster.heartbeat_interval_ms),
                 election_timeout: std::time::Duration::from_millis(config.cluster.election_timeout_ms),
+                compaction_retention: 10_000,
             },
             enable_transactions: config.cluster.enable_transactions,
             transaction_timeout: std::time::Duration::from_secs(config.cluster.transaction_timeout_secs),

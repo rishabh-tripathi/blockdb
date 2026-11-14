@@ -77,6 +77,9 @@ pub struct ConsentWriteRequest {
     pub purpose: String,
     #[serde(default)]
     pub metadata: Option<std::collections::BTreeMap<String, String>>,
+    /// Optional consent expiry (epoch ms); applies to grants only.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,7 +408,19 @@ impl ClusterNode {
         purpose: &str,
         metadata: std::collections::BTreeMap<String, String>,
     ) -> Result<ConsentEvent, BlockDBError> {
-        self.record_consent(subject_id, purpose, ConsentStatus::Granted, metadata)
+        self.record_consent(subject_id, purpose, ConsentStatus::Granted, metadata, None)
+            .await
+    }
+
+    /// Record a consent grant that expires at `expires_at_ms` (consent TTL).
+    pub async fn consent_grant_with_expiry(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        metadata: std::collections::BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        self.record_consent(subject_id, purpose, ConsentStatus::Granted, metadata, expires_at_ms)
             .await
     }
 
@@ -416,7 +431,7 @@ impl ClusterNode {
         purpose: &str,
         metadata: std::collections::BTreeMap<String, String>,
     ) -> Result<ConsentEvent, BlockDBError> {
-        self.record_consent(subject_id, purpose, ConsentStatus::Withdrawn, metadata)
+        self.record_consent(subject_id, purpose, ConsentStatus::Withdrawn, metadata, None)
             .await
     }
 
@@ -426,11 +441,22 @@ impl ClusterNode {
         purpose: &str,
         status: ConsentStatus,
         metadata: std::collections::BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
     ) -> Result<ConsentEvent, BlockDBError> {
         let (key, value, event) =
-            ConsentStore::prepare_event(subject_id, purpose, status, metadata)?;
+            ConsentStore::prepare_event(subject_id, purpose, status, metadata, expires_at_ms)?;
         self.put(key.as_bytes(), &value).await?;
         Ok(event)
+    }
+
+    /// Export a subject's full consent record (GDPR subject-access request).
+    pub async fn consent_export(
+        &self,
+        subject_id: &str,
+    ) -> Result<crate::consent::SubjectExport, BlockDBError> {
+        ConsentStore::new(self.storage.clone())
+            .export_subject(subject_id)
+            .await
     }
 
     /// Current consent state for a (subject, purpose), read from the local store.
@@ -613,6 +639,7 @@ impl ClusterNode {
                 (&Method::GET, "/consent/status") => self.handle_consent_status(&query).await,
                 (&Method::GET, "/consent/history") => self.handle_consent_history(&query).await,
                 (&Method::GET, "/consent/list") => self.handle_consent_list(&query).await,
+                (&Method::GET, "/consent/export") => self.handle_consent_export(&query).await,
                 (&Method::GET, "/status") => self.handle_status().await,
                 (&Method::GET, "/health") => self.handle_health().await,
                 (&Method::GET, "/metrics") => Ok(self.handle_metrics().await),
@@ -765,7 +792,8 @@ impl ClusterNode {
         let metadata = r.metadata.unwrap_or_default();
         self.metrics.kv_writes_total.fetch_add(1, Ordering::Relaxed);
         let event = if grant {
-            self.consent_grant(&r.subject_id, &r.purpose, metadata).await
+            self.consent_grant_with_expiry(&r.subject_id, &r.purpose, metadata, r.expires_at_ms)
+                .await
         } else {
             self.consent_withdraw(&r.subject_id, &r.purpose, metadata).await
         };
@@ -801,6 +829,13 @@ impl ClusterNode {
             .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
         let states = self.consent_list(&subject).await?;
         Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "states": states})))
+    }
+
+    async fn handle_consent_export(&self, query: &str) -> Result<Response<Body>, BlockDBError> {
+        let subject = query_param(query, "subject")
+            .ok_or_else(|| BlockDBError::InvalidData("missing 'subject'".to_string()))?;
+        let export = self.consent_export(&subject).await?;
+        Ok(json(StatusCode::OK, &serde_json::json!({"success": true, "export": export})))
     }
 
     async fn handle_status(&self) -> Result<Response<Body>, BlockDBError> {

@@ -32,9 +32,19 @@ impl std::fmt::Display for ConsentStatus {
     }
 }
 
+/// Current schema version for a consent event, so the record format can evolve.
+pub const CONSENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    CONSENT_SCHEMA_VERSION
+}
+
 /// A single immutable consent event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsentEvent {
+    /// Record schema version (for forward-compatible evolution of this struct).
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// Unique id for this event.
     pub event_id: String,
     /// The data subject (e.g. the user/person the consent is about).
@@ -45,6 +55,10 @@ pub struct ConsentEvent {
     pub status: ConsentStatus,
     /// Milliseconds since the Unix epoch when the event was recorded.
     pub timestamp_ms: u64,
+    /// Optional expiry: a grant stops being effective after this time (consent TTL /
+    /// retention of consent validity). `None` means it does not expire on its own.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
     /// Free-form context: policy version, source system, IP, legal basis, etc.
     pub metadata: BTreeMap<String, String>,
     /// SHA-256 over the canonical event content, giving each event a tamper-evident id
@@ -59,6 +73,16 @@ impl ConsentEvent {
         status: ConsentStatus,
         metadata: BTreeMap<String, String>,
     ) -> Self {
+        Self::with_expiry(subject_id, purpose, status, metadata, None)
+    }
+
+    pub fn with_expiry(
+        subject_id: String,
+        purpose: String,
+        status: ConsentStatus,
+        metadata: BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
+    ) -> Self {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -66,11 +90,13 @@ impl ConsentEvent {
         let event_id = uuid::Uuid::new_v4().to_string();
 
         let mut event = ConsentEvent {
+            schema_version: CONSENT_SCHEMA_VERSION,
             event_id,
             subject_id,
             purpose,
             status,
             timestamp_ms,
+            expires_at_ms,
             metadata,
             proof_hash: String::new(),
         };
@@ -78,14 +104,25 @@ impl ConsentEvent {
         event
     }
 
+    /// Whether this event, if it is the latest, currently represents effective consent
+    /// — i.e. it is a grant that has not expired as of `now_ms`.
+    pub fn is_effective_grant(&self, now_ms: u64) -> bool {
+        self.status == ConsentStatus::Granted && self.expires_at_ms.map_or(true, |e| now_ms < e)
+    }
+
     /// Canonical hash over the semantically meaningful fields (excluding the hash itself).
     fn compute_proof_hash(&self) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(self.schema_version.to_be_bytes());
         hasher.update(self.event_id.as_bytes());
         hasher.update(self.subject_id.as_bytes());
         hasher.update(self.purpose.as_bytes());
         hasher.update(self.status.to_string().as_bytes());
         hasher.update(self.timestamp_ms.to_be_bytes());
+        if let Some(exp) = self.expires_at_ms {
+            hasher.update(b"exp=");
+            hasher.update(exp.to_be_bytes());
+        }
         for (k, v) in &self.metadata {
             hasher.update(k.as_bytes());
             hasher.update(b"=");
@@ -100,6 +137,21 @@ impl ConsentEvent {
     pub fn verify(&self) -> bool {
         self.proof_hash == self.compute_proof_hash()
     }
+}
+
+/// A subject's full exported consent record (for GDPR subject-access / portability).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubjectExport {
+    pub subject_id: String,
+    pub exported_at_ms: u64,
+    pub events_by_purpose: BTreeMap<String, Vec<ConsentEvent>>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Current consent state for a (subject, purpose) pair, derived from the latest event.
@@ -130,7 +182,19 @@ impl ConsentStore {
         purpose: &str,
         metadata: BTreeMap<String, String>,
     ) -> Result<ConsentEvent, BlockDBError> {
-        self.append_event(subject_id, purpose, ConsentStatus::Granted, metadata)
+        self.append_event(subject_id, purpose, ConsentStatus::Granted, metadata, None)
+            .await
+    }
+
+    /// Record a consent grant that expires at `expires_at_ms` (consent TTL).
+    pub async fn grant_with_expiry(
+        &self,
+        subject_id: &str,
+        purpose: &str,
+        metadata: BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<ConsentEvent, BlockDBError> {
+        self.append_event(subject_id, purpose, ConsentStatus::Granted, metadata, expires_at_ms)
             .await
     }
 
@@ -141,7 +205,7 @@ impl ConsentStore {
         purpose: &str,
         metadata: BTreeMap<String, String>,
     ) -> Result<ConsentEvent, BlockDBError> {
-        self.append_event(subject_id, purpose, ConsentStatus::Withdrawn, metadata)
+        self.append_event(subject_id, purpose, ConsentStatus::Withdrawn, metadata, None)
             .await
     }
 
@@ -155,6 +219,7 @@ impl ConsentStore {
         purpose: &str,
         status: ConsentStatus,
         metadata: BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
     ) -> Result<(String, Vec<u8>, ConsentEvent), BlockDBError> {
         if subject_id.is_empty() || purpose.is_empty() {
             return Err(BlockDBError::InvalidData(
@@ -167,7 +232,13 @@ impl ConsentStore {
             ));
         }
 
-        let event = ConsentEvent::new(subject_id.to_string(), purpose.to_string(), status, metadata);
+        let event = ConsentEvent::with_expiry(
+            subject_id.to_string(),
+            purpose.to_string(),
+            status,
+            metadata,
+            expires_at_ms,
+        );
         let key = event_key(subject_id, purpose, event.timestamp_ms, &event.event_id);
         let value = serde_json::to_vec(&event).map_err(|e| {
             BlockDBError::InvalidData(format!("failed to serialize consent event: {}", e))
@@ -181,11 +252,35 @@ impl ConsentStore {
         purpose: &str,
         status: ConsentStatus,
         metadata: BTreeMap<String, String>,
+        expires_at_ms: Option<u64>,
     ) -> Result<ConsentEvent, BlockDBError> {
-        let (key, value, event) = Self::prepare_event(subject_id, purpose, status, metadata)?;
+        let (key, value, event) =
+            Self::prepare_event(subject_id, purpose, status, metadata, expires_at_ms)?;
         // Each event has a unique, time-ordered key, so the append-only store accepts it.
         self.db.put(key.as_bytes(), &value).await?;
         Ok(event)
+    }
+
+    /// Export everything recorded for a subject across all purposes — the full
+    /// immutable event history grouped by purpose, for a GDPR subject-access /
+    /// data-portability request.
+    pub async fn export_subject(&self, subject_id: &str) -> Result<SubjectExport, BlockDBError> {
+        let prefix = format!("{}{}/", CONSENT_PREFIX, subject_id);
+        let entries = self.db.scan_prefix(prefix.as_bytes()).await?;
+        let mut by_purpose: BTreeMap<String, Vec<ConsentEvent>> = BTreeMap::new();
+        for (_key, value) in entries {
+            let event: ConsentEvent = serde_json::from_slice(&value)
+                .map_err(|e| BlockDBError::InvalidData(format!("corrupt consent event: {}", e)))?;
+            by_purpose.entry(event.purpose.clone()).or_default().push(event);
+        }
+        for events in by_purpose.values_mut() {
+            events.sort_by_key(|e| e.timestamp_ms);
+        }
+        Ok(SubjectExport {
+            subject_id: subject_id.to_string(),
+            exported_at_ms: now_ms(),
+            events_by_purpose: by_purpose,
+        })
     }
 
     /// Full immutable history of events for a (subject, purpose), oldest first.
@@ -224,12 +319,14 @@ impl ConsentStore {
         }))
     }
 
-    /// Convenience predicate: is consent currently granted for this purpose?
+    /// Convenience predicate: is consent currently *effective* for this purpose — the
+    /// latest event is a grant and it has not expired?
     pub async fn is_granted(&self, subject_id: &str, purpose: &str) -> Result<bool, BlockDBError> {
+        let now = now_ms();
         Ok(self
             .status(subject_id, purpose)
             .await?
-            .map(|s| s.status == ConsentStatus::Granted)
+            .map(|s| s.latest_event.is_effective_grant(now))
             .unwrap_or(false))
     }
 
@@ -355,6 +452,44 @@ mod tests {
         assert_eq!(sms.status, ConsentStatus::Withdrawn);
         let email = states.iter().find(|s| s.purpose == "email").unwrap();
         assert_eq!(email.status, ConsentStatus::Granted);
+    }
+
+    #[tokio::test]
+    async fn expired_grant_is_not_effective() {
+        let (store, _dir) = store().await;
+        // Grant that already expired a second ago.
+        let past = now_ms() - 1000;
+        store
+            .grant_with_expiry("dave", "newsletter", BTreeMap::new(), Some(past))
+            .await
+            .unwrap();
+        // Latest event is a grant, but it is expired -> not effectively granted.
+        assert!(!store.is_granted("dave", "newsletter").await.unwrap());
+        let state = store.status("dave", "newsletter").await.unwrap().unwrap();
+        assert_eq!(state.status, ConsentStatus::Granted);
+        assert!(!state.latest_event.is_effective_grant(now_ms()));
+
+        // A non-expiring grant is effective.
+        store.grant("dave", "email", BTreeMap::new()).await.unwrap();
+        assert!(store.is_granted("dave", "email").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn export_subject_returns_all_purposes() {
+        let (store, _dir) = store().await;
+        store.grant("erin", "email", BTreeMap::new()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        store.withdraw("erin", "email", BTreeMap::new()).await.unwrap();
+        store.grant("erin", "sms", BTreeMap::new()).await.unwrap();
+
+        let export = store.export_subject("erin").await.unwrap();
+        assert_eq!(export.subject_id, "erin");
+        assert_eq!(export.events_by_purpose.len(), 2);
+        assert_eq!(export.events_by_purpose["email"].len(), 2);
+        assert_eq!(export.events_by_purpose["sms"].len(), 1);
+        // Events are chronological.
+        let email = &export.events_by_purpose["email"];
+        assert!(email[0].timestamp_ms <= email[1].timestamp_ms);
     }
 
     #[tokio::test]
